@@ -169,6 +169,7 @@ from vllm.v1.sample.logits_processor.interface import LogitsProcessor
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.rejection_sampler import RejectionSampler
 from vllm.v1.sample.sampler import Sampler
+from vllm.v1.spec_decode.ddtree import DDTreeProposer, ddtree_verify
 from vllm.v1.spec_decode.dflash import DFlashProposer
 from vllm.v1.spec_decode.draft_model import DraftModelProposer
 from vllm.v1.spec_decode.eagle import EagleProposer
@@ -526,6 +527,7 @@ class GPUModelRunner(
                 | SuffixDecodingProposer
                 | EagleProposer
                 | DFlashProposer
+                | DDTreeProposer
                 | DraftModelProposer
                 | MedusaProposer
                 | ExtractHiddenStatesProposer
@@ -560,6 +562,9 @@ class GPUModelRunner(
                 )
             elif self.speculative_config.use_gemma4_mtp():
                 self.drafter = Gemma4Proposer(self.vllm_config, self.device, self)
+            elif self.speculative_config.use_ddtree():
+                self.drafter = DDTreeProposer(self.vllm_config, self.device, self)
+                self.use_aux_hidden_state_outputs = True
             elif self.speculative_config.use_dflash():
                 self.drafter = DFlashProposer(self.vllm_config, self.device, self)
                 self.use_aux_hidden_state_outputs = True
@@ -2039,6 +2044,54 @@ class GPUModelRunner(
             self.positions[:total_num_scheduled_tokens],
         )
 
+        # DDTree: override tree node positions with depth-based values for RoPE.
+        # Slot mapping above was computed from sequential positions (needed for
+        # unique KV slots per sibling); depth-based positions are only for RoPE
+        # so that siblings at the same depth share a position ID.
+        _ddtree_drafter = getattr(self, "drafter", None)
+        if (
+            scheduler_output.scheduled_spec_decode_tokens
+            and isinstance(_ddtree_drafter, DDTreeProposer)
+            and _ddtree_drafter._node_depths is not None
+        ):
+            for r_spec_idx, req_id in enumerate(
+                scheduler_output.scheduled_spec_decode_tokens
+            ):
+                # New requests (just finished prefill) are appended to
+                # scheduled_spec_decode_tokens but have no _node_depths entry yet.
+                #   scheduled_spec_decode_tokens = {req-abc: [...], req-xyz: [...],
+                #                                   req-999: [...]}
+                #   _node_depths = [tensor([1,1,2,2,3,...]), tensor([1,2,1,3,...])]
+                #                   req-abc                  req-xyz  (req-999 missing)
+                # Skip them — correct next step when _node_depths rebuilds.
+                if r_spec_idx >= len(_ddtree_drafter._node_depths):
+                    continue
+                # DDTree positions are non-monotonic — unlike DFlash/standard decoding
+                # where positions strictly increase (c+1, c+2, c+3, ...), siblings at
+                # the same tree depth share one position ID so RoPE treats them as
+                # alternatives for the same output slot:
+                #
+                #   tree:          root (c)
+                #                 /    \
+                #             "cat"   "dog"    ← depth 1, both get position c+1
+                #             /   \
+                #          "sat" "ran"         ← depth 2, both get position c+2
+                #           /
+                #         "on"                 ← depth 3, gets position c+3
+                #
+                #   flat node order:  ["cat", "dog", "sat", "ran", "on"]
+                #   depths:           [  1,     1,     2,     2,     3 ]
+                #   positions:        [ c+1,   c+1,   c+2,   c+2,  c+3 ]
+                req_idx = self.input_batch.req_id_to_index[req_id]
+                token_start = int(cu_num_tokens[req_idx]) - int(
+                    num_scheduled_tokens[req_idx]
+                )
+                context_len = int(self.input_batch.num_computed_tokens_cpu[req_idx])
+                depths = _ddtree_drafter._node_depths[r_spec_idx]  # [budget] on GPU
+                self.positions[
+                    token_start + 1 : token_start + 1 + _ddtree_drafter._budget
+                ] = context_len + depths
+
         # Copy the tensors to the GPU.
         self._prepare_input_ids(
             scheduler_output,
@@ -2335,7 +2388,8 @@ class GPUModelRunner(
 
             if self.speculative_config and spec_decode_common_attn_metadata is None:
                 if isinstance(
-                    self.drafter, (EagleProposer, DFlashProposer, Gemma4Proposer)
+                    self.drafter,
+                    (EagleProposer, DFlashProposer, DDTreeProposer, Gemma4Proposer),
                 ):
                     if self.drafter.kv_cache_gid == kv_cache_gid:
                         spec_decode_common_attn_metadata = cm
@@ -3416,12 +3470,62 @@ class GPUModelRunner(
             draft_token_ids_cpu, _ = self._get_draft_token_ids_cpu()
             self.input_batch.update_async_spec_token_ids(draft_token_ids_cpu)
 
-        sampler_output = self.rejection_sampler(
-            spec_decode_metadata,
-            None,  # draft_probs
-            logits,
-            sampling_metadata,
-        )
+        if (
+            self.speculative_config is not None
+            and self.speculative_config.use_ddtree()
+            and isinstance(self.drafter, DDTreeProposer)
+            and self.drafter._child_maps is not None
+            # Only use tree-aware verify when every request in the batch is
+            # in spec-decode mode.  When regular-decode requests are mixed in
+            # (e.g. during the first few steps when some prompts are still in
+            # prefill), fall back to the rejection sampler.
+            and len(self.drafter._child_maps)
+            == len(spec_decode_metadata.num_draft_tokens)
+            # All spec-decode requests must have exactly budget draft tokens;
+            # finishing requests may have fewer, which breaks view(batch, budget).
+            and sum(spec_decode_metadata.num_draft_tokens)
+            == self.drafter._budget * len(self.drafter._child_maps)
+        ):
+            assert logits is not None
+            batch_size = len(spec_decode_metadata.num_draft_tokens)
+            output_token_ids = ddtree_verify(
+                logits=logits,
+                target_logits_indices=spec_decode_metadata.target_logits_indices,
+                bonus_logits_indices=spec_decode_metadata.bonus_logits_indices,
+                draft_token_ids=spec_decode_metadata.draft_token_ids,
+                child_maps=self.drafter._child_maps,
+                budget=self.drafter._budget,
+                batch_size=batch_size,
+                device=self.device,
+            )
+            sampler_output = SamplerOutput(
+                sampled_token_ids=output_token_ids,
+                logprobs_tensors=None,
+            )
+        else:
+            # Fall back to flat rejection sampler — fires when batch is mixed
+            # (some requests still in prefill) or a request has fewer than
+            # budget tokens (finishing). ddtree_verify needs view(batch, budget)
+            # which requires uniform token counts.
+            #
+            # Won't crash but acceptance collapses to ~1 token: the sampler
+            # treats tree siblings as a sequential chain, so after accepting
+            # the rank-0 depth-1 token it checks its sibling as if it follows:
+            #   actual tree:       root
+            #                     /    \
+            #                  "cat"  "dog"   <- siblings, both depth 1
+            #                  /
+            #                "sat"            <- depth 2
+            #
+            #   sampler sees:  root -> "cat" -> "dog"?  no -> stop (accepted 1)
+            #   ddtree_verify: root -> "cat" -> "sat"?  yes -> (accepted 2+)
+            # Resumes correctly next step when batch is uniform again.
+            sampler_output = self.rejection_sampler(
+                spec_decode_metadata,
+                None,  # draft_probs
+                logits,
+                sampling_metadata,
+            )
         return sampler_output
 
     def _bookkeeping_sync(
@@ -4303,6 +4407,7 @@ class GPUModelRunner(
                     self.drafter,
                     EagleProposer
                     | DFlashProposer
+                    | DDTreeProposer
                     | DraftModelProposer
                     | ExtractHiddenStatesProposer
                     | Gemma4Proposer,
@@ -4710,11 +4815,16 @@ class GPUModelRunner(
         elif (
             spec_config.use_eagle()
             or spec_config.use_dflash()
+            or spec_config.use_ddtree()
             or spec_config.uses_draft_model()
         ):
             assert isinstance(
                 self.drafter,
-                EagleProposer | DFlashProposer | DraftModelProposer | Gemma4Proposer,
+                EagleProposer
+                | DFlashProposer
+                | DDTreeProposer
+                | DraftModelProposer
+                | Gemma4Proposer,
             )
 
             if spec_config.disable_padded_drafter_batch:
@@ -5635,6 +5745,7 @@ class GPUModelRunner(
                     self.drafter,
                     EagleProposer
                     | DFlashProposer
+                    | DDTreeProposer
                     | DraftModelProposer
                     | ExtractHiddenStatesProposer
                     | Gemma4Proposer,
@@ -6449,7 +6560,11 @@ class GPUModelRunner(
         ):
             assert isinstance(
                 self.drafter,
-                EagleProposer | DFlashProposer | DraftModelProposer | Gemma4Proposer,
+                EagleProposer
+                | DFlashProposer
+                | DDTreeProposer
+                | DraftModelProposer
+                | Gemma4Proposer,
             )
             self.drafter.initialize_attn_backend(kv_cache_config, kernel_block_sizes)
 
@@ -6504,6 +6619,7 @@ class GPUModelRunner(
                 self.drafter,
                 EagleProposer
                 | DFlashProposer
+                | DDTreeProposer
                 | ExtractHiddenStatesProposer
                 | Gemma4Proposer,
             )
