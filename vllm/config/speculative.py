@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import ast
 import copy
 from typing import TYPE_CHECKING, Any, Literal, get_args
 
@@ -53,8 +54,14 @@ MTPModelTypes = Literal[
 ]
 NgramGPUTypes = Literal["ngram_gpu"]
 DFlashModelTypes = Literal["dflash"]
+DDTreeModelTypes = Literal["ddtree"]
 EagleModelTypes = Literal[
-    "eagle", "eagle3", "extract_hidden_states", MTPModelTypes, DFlashModelTypes
+    "eagle",
+    "eagle3",
+    "extract_hidden_states",
+    MTPModelTypes,
+    DFlashModelTypes,
+    DDTreeModelTypes,
 ]
 SpeculativeMethod = Literal[
     "ngram",
@@ -144,6 +151,9 @@ class SpeculativeConfig:
     provided. Defaults to 1."""
 
     # Alternative drafting strategies
+    speculative_token_tree: str | None = None
+    """Specifies the tree structure for speculative token generation.
+    """
     parallel_drafting: bool = False
     """Enable parallel drafting, where all speculative tokens are generated
     in parallel rather than sequentially. This can improve performance but
@@ -279,6 +289,7 @@ class SpeculativeConfig:
             "eagle3",
             "extract_hidden_states",
             "dflash",
+            "ddtree",
         )
         factors.append(uses_aux_hidden_states)
 
@@ -644,7 +655,7 @@ class SpeculativeConfig:
                 )
 
                 # Automatically detect the method
-                if self.method in ("eagle", "eagle3", "dflash"):
+                if self.method in ("eagle", "eagle3", "dflash", "ddtree"):
                     pass
                 # examples:
                 # yuhuili/EAGLE-LLaMA3-Instruct-8B
@@ -688,7 +699,7 @@ class SpeculativeConfig:
                     )
 
                 # Replace hf_config for EAGLE draft_model
-                if self.method in ("eagle", "eagle3", "dflash"):
+                if self.method in ("eagle", "eagle3", "dflash", "ddtree"):
                     from vllm.transformers_utils.configs.eagle import EAGLEConfig
                     from vllm.transformers_utils.configs.speculators import (
                         SpeculatorsConfig,
@@ -708,7 +719,7 @@ class SpeculativeConfig:
                         self.draft_model_config.hf_config = eagle_config
                         self.update_arch_()
 
-                if self.method == "dflash":
+                if self.method in ("dflash", "ddtree"):
                     self.parallel_drafting = True
 
                 if self.num_speculative_tokens is not None and hasattr(
@@ -735,10 +746,23 @@ class SpeculativeConfig:
                             f" must be divisible by {n_predict=}"
                         )
 
-                if self.num_speculative_tokens is None:
-                    raise ValueError(
-                        "A speculative model was provided, but "
-                        "`num_speculative_tokens` was not provided"
+                if self.speculative_token_tree is None:
+                    if self.num_speculative_tokens is None:
+                        raise ValueError(
+                            "A speculative model was provided, but neither "
+                            "`speculative_token_tree` nor `num_speculative_tokens` "
+                            "was provided"
+                        )
+
+                    # Generate chain of tokens.
+                    self.speculative_token_tree = str(
+                        [(i + 1) * (0,) for i in range(self.num_speculative_tokens)]
+                    )
+                else:
+                    # Sort the token tree breadth-first.
+                    tree_choices = ast.literal_eval(self.speculative_token_tree)
+                    self.speculative_token_tree = str(
+                        sorted(tree_choices, key=lambda t: (len(t), t))
                     )
 
                 self.draft_tensor_parallel_size = (
@@ -1045,10 +1069,13 @@ class SpeculativeConfig:
         )
 
     def use_eagle(self) -> bool:
-        return self.method in ("eagle", "eagle3", "mtp", "dflash")
+        return self.method in ("eagle", "eagle3", "mtp", "dflash", "ddtree")
 
     def use_dflash(self) -> bool:
         return self.method == "dflash"
+
+    def use_ddtree(self) -> bool:
+        return self.method == "ddtree"
 
     def uses_draft_model(self) -> bool:
         return self.method == "draft_model"
