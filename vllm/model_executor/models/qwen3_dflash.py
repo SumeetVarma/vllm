@@ -131,7 +131,7 @@ class DFlashQwen3Attention(nn.Module):
         with the context K/V from the target model's hidden states. This forward op
         computes attention for the query tokens only.
         See also: precompute_and_store_context_kv"""
-        qkv = F.linear(hidden_states, self.qkv_proj.weight, self.qkv_proj.bias)
+        qkv, _ = self.qkv_proj(hidden_states)  # _DFLASH_QUANT_PATCH_v1_
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
         # Per-head RMSNorm
@@ -249,6 +249,7 @@ class DFlashQwen3Model(nn.Module):
                     current_vllm_config,
                     prefix=maybe_prefix(prefix, f"layers.{layer_idx + start_layer_id}"),
                     config=self.config,
+                    quant_config=self.quant_config,  # _DFLASH_QUANT_PATCH_v1_
                 )
                 for layer_idx in range(self.config.num_hidden_layers)
             ]
@@ -299,13 +300,9 @@ class DFlashQwen3Model(nn.Module):
         self._hidden_norm_weight = self.hidden_norm.weight.data
 
         # KV projection weights: [num_layers * 2 * kv_size, hidden_size]
-        kv_weights = [a.qkv_proj.weight[a.q_size :] for a in layers_attn]
-        self._fused_kv_weight = torch.cat(kv_weights, dim=0)
-        if has_bias:
-            kv_biases = [a.qkv_proj.bias[a.q_size :] for a in layers_attn]
-            self._fused_kv_bias: torch.Tensor | None = torch.cat(kv_biases, dim=0)
-        else:
-            self._fused_kv_bias = None
+        # # _DFLASH_QUANT_PATCH_v1_ skip fused KV stash; per-layer qkv_proj() used at runtime
+        self._fused_kv_weight = None
+        self._fused_kv_bias = None
 
         # K-norm weights: list of [head_dim] tensors, one per layer.
         self._k_norm_weights = [a.k_norm.weight.data for a in layers_attn]
@@ -378,17 +375,16 @@ class DFlashQwen3Model(nn.Module):
             self._hidden_norm_weight,
             self._rms_norm_eps,
         )
-        all_kv_flat = F.linear(
-            normed_context_states, self._fused_kv_weight, self._fused_kv_bias
-        )
-        # Single contiguous copy that separates K/V and transposes to
-        # layer-major layout.  Result: [2, L, num_ctx, nkv, hd] contiguous.
-        # Indexing dim-0 gives contiguous [L, num_ctx, nkv, hd] for K and V.
-        all_kv = (
-            all_kv_flat.view(num_ctx, L, 2, nkv, hd).permute(2, 1, 0, 3, 4).contiguous()
-        )
-        all_k = all_kv[0]  # [L, num_ctx, nkv, hd], contiguous
-        all_v = all_kv[1]  # [L, num_ctx, nkv, hd], contiguous
+        # # _DFLASH_QUANT_PATCH_v1_ per-layer qkv_proj() for quant compatibility (was fused F.linear)
+        all_k = torch.empty((L, num_ctx, nkv, hd), dtype=normed_context_states.dtype, device=normed_context_states.device)
+        all_v = torch.empty((L, num_ctx, nkv, hd), dtype=normed_context_states.dtype, device=normed_context_states.device)
+        for i, layer in enumerate(self.layers):
+            qkv_i, _ = layer.self_attn.qkv_proj(normed_context_states)
+            q_size = layer.self_attn.q_size
+            kv_i = qkv_i[:, q_size:]
+            k_i, v_i = kv_i.split([kv, kv], dim=-1)
+            all_k[i] = k_i.view(num_ctx, nkv, hd)
+            all_v[i] = v_i.view(num_ctx, nkv, hd)
 
         # --- Per-layer RMSNorm K (3D: [num_ctx, nkv, hd] per layer) ---
         all_k_normed = torch.empty_like(all_k)

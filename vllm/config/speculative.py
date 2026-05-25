@@ -1013,7 +1013,7 @@ class SpeculativeConfig:
             "laguna",
         ]
         if (
-            self.method in ("eagle3", "extract_hidden_states", "dflash")
+            self.method in ("eagle3", "extract_hidden_states", "dflash", "ddtree")
             and self.target_model_config
             and not any(
                 supported_model in self.target_model_config.hf_text_config.model_type
