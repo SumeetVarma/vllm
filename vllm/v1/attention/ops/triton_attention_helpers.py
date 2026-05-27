@@ -354,13 +354,19 @@ def load_qq_bias_tile(
     seq_offset,
     context_len,
     qq_bias_stride_0,
+    query_pos,
+    qq_bias_chain_prefix: tl.constexpr,
 ):
     """Load the qq-bias slice for keys that correspond to query rows."""
     key_rel_pos = seq_offset - context_len
-    is_query_key = key_rel_pos >= 0 and key_rel_pos < qq_bias_stride_0
+    is_query_key = (key_rel_pos >= 0) & (key_rel_pos < qq_bias_stride_0)
+    if qq_bias_chain_prefix > 0:
+        row_needs_bias = query_pos >= qq_bias_chain_prefix
+    else:
+        row_needs_bias = tl.full(query_pos.shape, True, dtype=tl.int1)
     return tl.load(
         qq_bias_row_ptrs + key_rel_pos[None, :],
-        mask=is_query_key[None, :],
+        mask=is_query_key[None, :] & row_needs_bias[:, None],
         other=0.0,
     )
 

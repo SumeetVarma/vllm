@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from abc import abstractmethod
 from collections.abc import Iterable
+import os
 
 import torch
 
@@ -45,6 +46,19 @@ class MambaBase(AttentionLayerBase):
         mamba_block_size = vllm_config.cache_config.mamba_block_size
         assert mamba_block_size is not None
         page_size_padded = vllm_config.cache_config.mamba_page_size_padded
+        speculative_config = vllm_config.speculative_config
+        num_speculative_blocks = (
+            speculative_config.num_speculative_tokens if speculative_config else 0
+        )
+        if speculative_config and getattr(speculative_config, "method", None) in (
+            "dflash",
+            "ddtree",
+        ):
+            override = os.environ.get("DFLASH_MAMBA_SPEC_BLOCKS")
+            if override is not None:
+                num_speculative_blocks = min(
+                    num_speculative_blocks, max(0, int(override))
+                )
         return MambaSpec(
             shapes=tuple(self.get_state_shape()),
             dtypes=self.get_state_dtype(),
@@ -52,11 +66,7 @@ class MambaBase(AttentionLayerBase):
             page_size_padded=page_size_padded,
             mamba_type=self.mamba_type,
             mamba_cache_mode=vllm_config.cache_config.mamba_cache_mode,
-            num_speculative_blocks=(
-                vllm_config.speculative_config.num_speculative_tokens
-                if vllm_config.speculative_config
-                else 0
-            ),
+            num_speculative_blocks=num_speculative_blocks,
         )
 
     def get_attn_backend(self) -> type[AttentionBackend]:

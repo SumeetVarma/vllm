@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -208,6 +209,7 @@ class Scheduler(SchedulerInterface):
 
         speculative_config = vllm_config.speculative_config
         self.use_eagle = False
+        self.use_ddtree_dynamic_lookahead = False
         self.num_spec_tokens = self.num_lookahead_tokens = 0
         if speculative_config:
             self.num_spec_tokens = speculative_config.num_speculative_tokens
@@ -216,6 +218,10 @@ class Scheduler(SchedulerInterface):
                 self.num_lookahead_tokens = self.num_spec_tokens
             if speculative_config.uses_draft_model():
                 self.num_lookahead_tokens = self.num_spec_tokens
+            self.use_ddtree_dynamic_lookahead = (
+                speculative_config.use_ddtree()
+                and os.environ.get("DDTREE_DYNAMIC_VALID") == "1"
+            )
 
         # Create the KV cache manager.
         if hash_block_size is None:
@@ -256,6 +262,25 @@ class Scheduler(SchedulerInterface):
             self.perf_metrics = ModelMetrics(vllm_config)
 
         self._pause_state: PauseState = PauseState.UNPAUSED
+
+    def _get_num_lookahead_tokens(self, request: Request) -> int:
+        if request.num_computed_tokens == 0:
+            return 0
+        if not self.use_ddtree_dynamic_lookahead:
+            return self.num_lookahead_tokens
+
+        full_tree_max_seq_len = int(
+            os.environ.get("DDTREE_FULL_TREE_MAX_SEQ_LEN", "512")
+        )
+        fallback_tokens = min(
+            self.num_spec_tokens,
+            int(os.environ.get("DDTREE_FALLBACK_VALID_TOKENS", "15")),
+        )
+        return (
+            self.num_spec_tokens
+            if request.num_computed_tokens <= full_tree_max_seq_len
+            else fallback_tokens
+        )
 
     def _mamba_block_aligned_split(
         self,
@@ -425,7 +450,7 @@ class Scheduler(SchedulerInterface):
                     new_blocks = self.kv_cache_manager.allocate_slots(
                         request,
                         num_new_tokens,
-                        num_lookahead_tokens=self.num_lookahead_tokens,
+                        num_lookahead_tokens=self._get_num_lookahead_tokens(request),
                     )
 
                     if new_blocks is not None:
@@ -683,9 +708,7 @@ class Scheduler(SchedulerInterface):
                 # extra block gets allocated which
                 # creates a mismatch between the number
                 # of local and remote blocks.
-                effective_lookahead_tokens = (
-                    0 if request.num_computed_tokens == 0 else self.num_lookahead_tokens
-                )
+                effective_lookahead_tokens = self._get_num_lookahead_tokens(request)
 
                 # Determine if we need to allocate cross-attention blocks.
                 num_encoder_tokens = 0

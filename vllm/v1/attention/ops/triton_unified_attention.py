@@ -7,6 +7,7 @@
 #  - Chih-Chieh Yang <chih.chieh.yang@ibm.com>
 #  - Thomas Parnell <tpa@zurich.ibm.com>
 
+import os
 from typing import Any
 
 import torch
@@ -143,6 +144,9 @@ def kernel_unified_attention(
     # over ``SLIDING_WINDOW`` inside the helpers.  ``-1`` disables.
     CHUNK_LOOKBACK: tl.constexpr = -1,
     CHUNK_SIZE: tl.constexpr = -1,
+    QUERY_POS_OFFSET: tl.constexpr = 0,
+    CONTEXT_LEN_OVERRIDE: tl.constexpr = -1,
+    QQ_BIAS_CHAIN_PREFIX: tl.constexpr = 0,
 ):
     USE_PER_TOKEN_HEAD_SCALES: tl.constexpr = KV_QUANT_MODE >= 2
 
@@ -173,9 +177,10 @@ def kernel_unified_attention(
     offs_m = tl.arange(0, BLOCK_M)
     offs_d = tl.arange(0, HEAD_SIZE_PADDED)
     offs_t = tl.arange(0, TILE_SIZE)
-    query_pos = q_block_local_idx * BLOCK_Q + offs_m // num_queries_per_kv
+    query_pos_local = q_block_local_idx * BLOCK_Q + offs_m // num_queries_per_kv
+    query_pos = query_pos_local + QUERY_POS_OFFSET
 
-    query_offset_0 = cur_batch_in_all_start_index + query_pos
+    query_offset_0 = cur_batch_in_all_start_index + query_pos_local
     query_offset_1 = kv_head_idx * num_queries_per_kv + offs_m % num_queries_per_kv
     query_offset = (
         query_offset_0[:, None] * query_stride_0
@@ -184,7 +189,7 @@ def kernel_unified_attention(
     )
 
     dim_mask = tl.where(offs_d < HEAD_SIZE, 1, 0).to(tl.int1)
-    query_mask_0 = tl.where(query_pos < cur_batch_query_len, 1, 0).to(tl.int1)
+    query_mask_0 = tl.where(query_pos_local < cur_batch_query_len, 1, 0).to(tl.int1)
     query_mask_1 = tl.where(query_offset_1 < num_query_heads, 1, 0).to(tl.int1)
 
     # Q : (BLOCK_M, HEAD_SIZE_PADDED)
@@ -203,7 +208,10 @@ def kernel_unified_attention(
     # acc : (BLOCK_M, HEAD_SIZE_PADDED)
     acc = tl.zeros([BLOCK_M, HEAD_SIZE_PADDED], dtype=tl.float32)
 
-    context_len = seq_len - cur_batch_query_len
+    if CONTEXT_LEN_OVERRIDE >= 0:
+        context_len = CONTEXT_LEN_OVERRIDE
+    else:
+        context_len = seq_len - cur_batch_query_len
 
     if USE_ALIBI_SLOPES:
         alibi_slope = tl.load(
@@ -328,9 +336,15 @@ def kernel_unified_attention(
             )
 
         if USE_QQ_BIAS:
-            S += load_qq_bias_tile(
-                qq_bias_row_ptrs, seq_offset, context_len, qq_bias_stride_0
+            qq_bias_tile = load_qq_bias_tile(
+                qq_bias_row_ptrs,
+                seq_offset,
+                context_len,
+                qq_bias_stride_0,
+                query_pos,
+                QQ_BIAS_CHAIN_PREFIX,
             )
+            S += qq_bias_tile
 
         M, L, P, alpha = softmax_step(S, M, L)
         acc = acc * alpha[:, None]
@@ -548,6 +562,11 @@ def unified_attention(
     v_scale_cache=None,  # [num_blocks, block_size, num_kv_heads] float32
     # Chunked attention: restrict attention to aligned blocks with lookback.
     chunk_lookback=-1,
+    # For callers that run a suffix of a larger query sequence while still
+    # needing masks/biases indexed by the original query positions.
+    query_pos_offset=0,
+    context_len_override=-1,
+    qq_bias_chain_prefix=0,
 ):
     assert q_descale is None, "Q scales not supported"
 
@@ -662,7 +681,11 @@ def unified_attention(
     grid: tuple[Any, ...]
     if not use_3d:
         grid = (total_num_q_blocks, num_kv_heads)
-        tile_size = TILE_SIZE_PREFILL
+        tile_size = (
+            TILE_SIZE_DECODE
+            if use_qq_bias and os.environ.get("DDTREE_QQ_TILE16") == "1"
+            else TILE_SIZE_PREFILL
+        )
     else:
         grid = (total_num_q_blocks, num_kv_heads, num_par_softmax_segments)
         tile_size = TILE_SIZE_DECODE
@@ -736,6 +759,9 @@ def unified_attention(
         KV_QUANT_MODE=kv_quant_mode,
         CHUNK_LOOKBACK=chunk_lookback,
         CHUNK_SIZE=chunk_size,
+        QUERY_POS_OFFSET=query_pos_offset,
+        CONTEXT_LEN_OVERRIDE=context_len_override,
+        QQ_BIAS_CHAIN_PREFIX=qq_bias_chain_prefix,
     )
 
     if use_3d:

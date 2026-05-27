@@ -24,6 +24,7 @@
 # limitations under the License.
 """Inference-only Qwen3.5 Series compatible with HuggingFace weights."""
 
+import os
 import typing
 from collections.abc import Callable, Iterable
 
@@ -693,6 +694,14 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
             if vllm_config.speculative_config
             else 0
         )
+        speculative_config = vllm_config.speculative_config
+        if speculative_config and getattr(speculative_config, "method", None) in (
+            "dflash",
+            "ddtree",
+        ):
+            override = os.environ.get("DFLASH_MAMBA_SPEC_BLOCKS")
+            if override is not None:
+                num_spec = min(num_spec, max(0, int(override)))
         return MambaStateShapeCalculator.gated_delta_net_state_shape(
             tp_size,
             hf_config.linear_num_key_heads,

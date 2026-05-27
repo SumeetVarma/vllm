@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inference-only Qwen3-Next/Qwen3.5 model."""
 
+import os
+
 import torch
 from einops import rearrange
 from torch import nn
@@ -293,6 +295,12 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
             if self.speculative_config
             else 0
         )
+        if self.speculative_config and getattr(
+            self.speculative_config, "method", None
+        ) in ("dflash", "ddtree"):
+            override = os.environ.get("DFLASH_MAMBA_SPEC_BLOCKS")
+            if override is not None:
+                self.num_spec = min(self.num_spec, max(0, int(override)))
         self.gqa_interleaved_layout = gqa_interleaved_layout
         if current_platform.is_xpu():
             self._forward_method = self.forward_xpu

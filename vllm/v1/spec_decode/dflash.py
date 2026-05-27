@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from dataclasses import replace
 from typing import Any
 
@@ -34,7 +35,19 @@ class DFlashProposer(SpecDecodeBaseProposer):
             runner=runner,
         )
 
-        # Only next_token_ids and mask tokens are query tokens, all other context is K/V
+        draft_depth = int(
+            os.environ.get("DFLASH_DRAFT_DEPTH", self.num_speculative_tokens)
+            or self.num_speculative_tokens
+        )
+        if self.method != "ddtree":
+            draft_depth = self.num_speculative_tokens
+        self.dflash_draft_depth = max(
+            1, min(self.num_speculative_tokens, draft_depth)
+        )
+
+        # Only next_token_ids and mask tokens are query tokens, all other context is K/V.
+        # Keep buffer capacity at the verifier budget; DDTREE can optionally run
+        # a shallower DFlash draft depth and expand those logits into a larger tree.
         self.max_query_tokens = self.max_batch_size * (1 + self.num_speculative_tokens)
         # Positions covers both context states + query states
         self.max_positions = self.max_num_tokens + self.max_query_tokens
@@ -99,7 +112,8 @@ class DFlashProposer(SpecDecodeBaseProposer):
         # Q from query embeddings (bonus + mask tokens).
         batch_size = cad.batch_size()
         num_context = target_token_ids.shape[0]
-        num_query_per_req = 1 + self.num_speculative_tokens
+        draft_depth = self.dflash_draft_depth
+        num_query_per_req = 1 + draft_depth
         num_query_total = batch_size * num_query_per_req
 
         # Store for build_model_inputs_first_pass to use
@@ -110,7 +124,7 @@ class DFlashProposer(SpecDecodeBaseProposer):
         self._dflash_hidden_states = target_hidden_states
 
         token_indices_to_sample = torch.empty(
-            batch_size * self.num_speculative_tokens,
+            batch_size * draft_depth,
             dtype=torch.int32,
             device=self.device,
         )
@@ -147,7 +161,7 @@ class DFlashProposer(SpecDecodeBaseProposer):
             parallel_drafting_token_id=self.parallel_drafting_token_id,
             block_size=self.block_size,
             num_query_per_req=num_query_per_req,
-            num_speculative_tokens=self.num_speculative_tokens,
+            num_speculative_tokens=draft_depth,
             total_input_tokens=num_context,
             BLOCK_SIZE=BLOCK_SIZE,
             HAS_NUM_REJECTED=has_num_rejected,

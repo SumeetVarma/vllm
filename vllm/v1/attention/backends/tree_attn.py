@@ -3,6 +3,8 @@
 """Attention layer with TreeAttention."""
 
 import ast
+import copy
+import os
 from dataclasses import dataclass
 from typing import ClassVar
 
@@ -12,8 +14,13 @@ from vllm import _custom_ops as ops
 from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType
 from vllm.logger import init_logger
+from vllm.v1.attention.backends.fa_utils import (
+    get_flash_attn_version,
+    is_flash_attn_varlen_func_available,
+)
 from vllm.v1.attention.backend import (
     AttentionBackend,
+    AttentionCGSupport,
     AttentionImpl,
     AttentionMetadataBuilder,
     AttentionType,
@@ -25,6 +32,9 @@ from vllm.v1.attention.backends.utils import (
 )
 from vllm.v1.attention.ops.triton_unified_attention import unified_attention
 from vllm.v1.kv_cache_interface import AttentionSpec
+
+if is_flash_attn_varlen_func_available():
+    from vllm.v1.attention.backends.fa_utils import flash_attn_varlen_func
 
 logger = init_logger(__name__)
 
@@ -162,6 +172,9 @@ class TreeAttentionMetadata:
 
 
 class TreeAttentionMetadataBuilder(AttentionMetadataBuilder[TreeAttentionMetadata]):
+    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
+    supports_update_block_table: bool = True
+
     def __init__(
         self,
         kv_cache_spec: AttentionSpec,
@@ -177,22 +190,36 @@ class TreeAttentionMetadataBuilder(AttentionMetadataBuilder[TreeAttentionMetadat
         spec_token_tree: str | None = None
         if spec := spec_config:
             spec_token_tree = spec.speculative_token_tree
-        tree_choices: list[tuple[int, ...]] = (
-            ast.literal_eval(spec_token_tree) if spec_token_tree is not None else [(0,)]
-        )
-        # Construct the tree attention bias.
-        depth_counts = _get_depth_counts(tree_choices)
-        self.tree_attn_bias = _prepare_tree_attn_bias(
-            tree_choices,
-            depth_counts,
-            dtype=torch.float32,
-            device=device,
-        )
+        if spec_config is not None and spec_config.use_ddtree():
+            # DDTree updates the bias every proposal step. CUDA graphs capture
+            # tensor addresses, so allocate the steady-state [N+1, N+1] buffer
+            # up front and let the proposer update it in place.
+            n = int(spec_config.num_speculative_tokens) + 1
+            self.tree_attn_bias = torch.full(
+                (n, n), float("-inf"), dtype=torch.float32, device=device
+            )
+            self.tree_attn_bias.tril_().zero_()
+            self.reorder_batch_threshold = n - 1
+            self._tree_decode_threshold = n
+        else:
+            tree_choices: list[tuple[int, ...]] = (
+                ast.literal_eval(spec_token_tree)
+                if spec_token_tree is not None
+                else [(0,)]
+            )
+            # Construct the tree attention bias.
+            depth_counts = _get_depth_counts(tree_choices)
+            self.tree_attn_bias = _prepare_tree_attn_bias(
+                tree_choices,
+                depth_counts,
+                dtype=torch.float32,
+                device=device,
+            )
 
-        self.reorder_batch_threshold = self.tree_attn_bias.shape[0]
-        # Decode threshold used in build(); may differ from reorder_batch_threshold
-        # when DDTree uses per-request 3D biases (see _update_target_tree_attn_bias).
-        self._tree_decode_threshold = self.tree_attn_bias.shape[0]
+            self.reorder_batch_threshold = self.tree_attn_bias.shape[0]
+            # Decode threshold used in build(); may differ from reorder_batch_threshold
+            # when DDTree uses per-request 3D biases (see _update_target_tree_attn_bias).
+            self._tree_decode_threshold = self.tree_attn_bias.shape[0]
 
     def build(
         self,
@@ -270,6 +297,17 @@ class TreeAttentionMetadataBuilder(AttentionMetadataBuilder[TreeAttentionMetadat
             tree_attn_bias=self.tree_attn_bias,
             causal=common_attn_metadata.causal,
         )
+
+    def update_block_table(
+        self,
+        metadata: TreeAttentionMetadata,
+        blk_table: torch.Tensor,
+        slot_mapping: torch.Tensor,
+    ) -> TreeAttentionMetadata:
+        new_metadata = copy.copy(metadata)
+        new_metadata.block_table = blk_table
+        new_metadata.slot_mapping = slot_mapping
+        return new_metadata
 
     def build_for_drafting(
         self,
@@ -382,6 +420,16 @@ class TreeAttentionImpl(AttentionImpl):
             self.sliding_window = (-1, -1)
         else:
             self.sliding_window = (sliding_window - 1, 0)
+        self.vllm_flash_attn_version = (
+            get_flash_attn_version(
+                requires_alibi=alibi_slopes is not None,
+                head_size=head_size,
+            )
+            if is_flash_attn_varlen_func_available()
+            else None
+        )
+        self._split_chain_cu_q: torch.Tensor | None = None
+        self._split_branch_cu_q: torch.Tensor | None = None
 
         if attn_type != AttentionType.DECODER:
             raise NotImplementedError(
@@ -457,30 +505,66 @@ class TreeAttentionImpl(AttentionImpl):
         num_decode_tokens = attn_metadata.num_decode_tokens
         descale_shape = (attn_metadata.query_start_loc.shape[0] - 1, key.shape[1])
         if prefill_meta := attn_metadata.prefill_metadata:
-            unified_attention(
-                q=query[num_decode_tokens:num_actual_tokens],
-                k=key_cache,
-                v=value_cache,
-                out=output[num_decode_tokens:num_actual_tokens],
-                cu_seqlens_q=prefill_meta.query_start_loc,
-                max_seqlen_q=prefill_meta.max_query_len,
-                seqused_k=prefill_meta.seq_lens,
-                max_seqlen_k=prefill_meta.max_seq_len,
-                softmax_scale=self.scale,
-                causal=prefill_meta.causal,
-                alibi_slopes=self.alibi_slopes,
-                window_size=self.sliding_window,
-                block_table=prefill_meta.block_table,
-                softcap=self.logits_soft_cap,
-                q_descale=None,  # Not supported
-                k_descale=layer._k_scale.expand(descale_shape),
-                v_descale=layer._v_scale.expand(descale_shape),
-            )
+            prefill_shape = (prefill_meta.query_start_loc.shape[0] - 1, key.shape[1])
+            if (
+                os.environ.get("TREE_ATTN_FLASH_PREFILL", "1") == "1"
+                and self.vllm_flash_attn_version is not None
+            ):
+                flash_attn_varlen_func(
+                    q=query[num_decode_tokens:num_actual_tokens],
+                    k=key_cache,
+                    v=value_cache,
+                    out=output[num_decode_tokens:num_actual_tokens],
+                    cu_seqlens_q=prefill_meta.query_start_loc,
+                    max_seqlen_q=prefill_meta.max_query_len,
+                    seqused_k=prefill_meta.seq_lens,
+                    max_seqlen_k=prefill_meta.max_seq_len,
+                    softmax_scale=self.scale,
+                    causal=prefill_meta.causal,
+                    alibi_slopes=self.alibi_slopes,
+                    window_size=list(self.sliding_window),
+                    block_table=prefill_meta.block_table,
+                    softcap=self.logits_soft_cap,
+                    fa_version=self.vllm_flash_attn_version,
+                    q_descale=None,
+                    k_descale=layer._k_scale.expand(prefill_shape),
+                    v_descale=layer._v_scale.expand(prefill_shape),
+                    num_splits=0,
+                )
+            else:
+                unified_attention(
+                    q=query[num_decode_tokens:num_actual_tokens],
+                    k=key_cache,
+                    v=value_cache,
+                    out=output[num_decode_tokens:num_actual_tokens],
+                    cu_seqlens_q=prefill_meta.query_start_loc,
+                    max_seqlen_q=prefill_meta.max_query_len,
+                    seqused_k=prefill_meta.seq_lens,
+                    max_seqlen_k=prefill_meta.max_seq_len,
+                    softmax_scale=self.scale,
+                    causal=prefill_meta.causal,
+                    alibi_slopes=self.alibi_slopes,
+                    window_size=self.sliding_window,
+                    block_table=prefill_meta.block_table,
+                    softcap=self.logits_soft_cap,
+                    q_descale=None,  # Not supported
+                    k_descale=layer._k_scale.expand(prefill_shape),
+                    v_descale=layer._v_scale.expand(prefill_shape),
+                )
 
         if decode_meta := attn_metadata.decode_metadata:
             tree_bias = decode_meta.tree_attn_bias
             if tree_bias is not None and tree_bias.numel() == 0:
                 tree_bias = None
+            causal_qq_bias = (
+                tree_bias is not None
+                and os.environ.get("DDTREE_CAUSAL_QQ") == "1"
+            )
+            qq_bias_chain_prefix = (
+                int(os.environ.get("DDTREE_FORCE_CHAIN_PREFIX", "0") or "0") + 1
+                if causal_qq_bias
+                else 0
+            )
 
             # Determine whether to use the 3D per-request DDTree bias.
             # Guard: if the batch shrank since the bias was built (requests
@@ -497,6 +581,7 @@ class TreeAttentionImpl(AttentionImpl):
                 ns_tokens = num_decode_tokens - num_spec * N1
                 if ns_tokens < 0:
                     use_3d_bias = False
+                    tree_bias = None
 
             if use_3d_bias:
                 # tree_bias is shape [num_spec, N+1, N+1] — one [N+1, N+1] matrix per
@@ -547,7 +632,7 @@ class TreeAttentionImpl(AttentionImpl):
                     seqused_k=decode_meta.seq_lens[num_nonspec:],
                     max_seqlen_k=decode_meta.max_seq_len,
                     softmax_scale=self.scale,
-                    causal=True,
+                    causal=causal_qq_bias,
                     alibi_slopes=self.alibi_slopes,
                     qq_bias=tree_bias,
                     window_size=self.sliding_window,
@@ -556,26 +641,126 @@ class TreeAttentionImpl(AttentionImpl):
                     q_descale=None,
                     k_descale=layer._k_scale.expand((num_spec, key.shape[1])),
                     v_descale=layer._v_scale.expand((num_spec, key.shape[1])),
+                    qq_bias_chain_prefix=qq_bias_chain_prefix,
                 )
             else:
-                unified_attention(
-                    q=query[:num_decode_tokens],
-                    k=key_cache,
-                    v=value_cache,
-                    out=output[:num_decode_tokens],
-                    cu_seqlens_q=decode_meta.query_start_loc,
-                    max_seqlen_q=decode_meta.max_query_len,
-                    seqused_k=decode_meta.seq_lens,
-                    max_seqlen_k=decode_meta.max_seq_len,
-                    softmax_scale=self.scale,
-                    causal=decode_meta.causal,
-                    alibi_slopes=self.alibi_slopes,
-                    qq_bias=tree_bias,
-                    window_size=self.sliding_window,
-                    block_table=decode_meta.block_table,
-                    softcap=self.logits_soft_cap,
-                    q_descale=None,  # Not supported
-                    k_descale=layer._k_scale.expand(descale_shape),
-                    v_descale=layer._v_scale.expand(descale_shape),
+                force_chain_prefix = int(
+                    os.environ.get("DDTREE_FORCE_CHAIN_PREFIX", "0") or "0"
                 )
+                split_chain_verify = (
+                    os.environ.get("DDTREE_SPLIT_CHAIN_VERIFY") == "1"
+                    and tree_bias is not None
+                    and tree_bias.ndim == 2
+                    and attn_metadata.num_decodes == 1
+                    and self.vllm_flash_attn_version is not None
+                    and force_chain_prefix > 0
+                )
+                if split_chain_verify:
+                    n1 = int(tree_bias.shape[-1])
+                    chain_q = min(force_chain_prefix + 1, n1, num_decode_tokens)
+                    branch_q = num_decode_tokens - chain_q
+                    split_chain_verify = branch_q > 0
+
+                if split_chain_verify:
+                    assert tree_bias is not None
+                    n1 = int(tree_bias.shape[-1])
+                    chain_q = min(force_chain_prefix + 1, n1, num_decode_tokens)
+                    branch_q = num_decode_tokens - chain_q
+                    branch_count = n1 - chain_q
+                    chain_seq_lens = decode_meta.seq_lens - branch_count
+                    chain_descale_shape = (1, key.shape[1])
+                    if (
+                        self._split_chain_cu_q is None
+                        or self._split_chain_cu_q.device != decode_meta.query_start_loc.device
+                        or self._split_chain_cu_q.dtype != decode_meta.query_start_loc.dtype
+                    ):
+                        self._split_chain_cu_q = torch.empty(
+                            2,
+                            dtype=decode_meta.query_start_loc.dtype,
+                            device=decode_meta.query_start_loc.device,
+                        )
+                    self._split_chain_cu_q[0].zero_()
+                    self._split_chain_cu_q[1].fill_(chain_q)
+                    flash_attn_varlen_func(
+                        q=query[:chain_q],
+                        k=key_cache,
+                        v=value_cache,
+                        out=output[:chain_q],
+                        cu_seqlens_q=self._split_chain_cu_q,
+                        max_seqlen_q=chain_q,
+                        seqused_k=chain_seq_lens,
+                        max_seqlen_k=decode_meta.max_seq_len - branch_count,
+                        softmax_scale=self.scale,
+                        causal=True,
+                        alibi_slopes=self.alibi_slopes,
+                        window_size=list(self.sliding_window),
+                        block_table=decode_meta.block_table,
+                        softcap=self.logits_soft_cap,
+                        fa_version=self.vllm_flash_attn_version,
+                        q_descale=None,
+                        k_descale=layer._k_scale.expand(chain_descale_shape),
+                        v_descale=layer._v_scale.expand(chain_descale_shape),
+                        num_splits=0,
+                    )
+                    if (
+                        self._split_branch_cu_q is None
+                        or self._split_branch_cu_q.device != decode_meta.query_start_loc.device
+                        or self._split_branch_cu_q.dtype != decode_meta.query_start_loc.dtype
+                    ):
+                        self._split_branch_cu_q = torch.empty(
+                            2,
+                            dtype=decode_meta.query_start_loc.dtype,
+                            device=decode_meta.query_start_loc.device,
+                        )
+                    self._split_branch_cu_q[0].zero_()
+                    self._split_branch_cu_q[1].fill_(branch_q)
+                    unified_attention(
+                        q=query[chain_q:num_decode_tokens],
+                        k=key_cache,
+                        v=value_cache,
+                        out=output[chain_q:num_decode_tokens],
+                        cu_seqlens_q=self._split_branch_cu_q,
+                        max_seqlen_q=branch_q,
+                        seqused_k=decode_meta.seq_lens,
+                        max_seqlen_k=decode_meta.max_seq_len,
+                        softmax_scale=self.scale,
+                        causal=causal_qq_bias,
+                        alibi_slopes=self.alibi_slopes,
+                        qq_bias=tree_bias,
+                        window_size=self.sliding_window,
+                        block_table=decode_meta.block_table,
+                        softcap=self.logits_soft_cap,
+                        q_descale=None,
+                        k_descale=layer._k_scale.expand(chain_descale_shape),
+                        v_descale=layer._v_scale.expand(chain_descale_shape),
+                        query_pos_offset=chain_q,
+                        context_len_override=int(decode_meta.max_seq_len - n1),
+                        qq_bias_chain_prefix=0,
+                    )
+                else:
+                    unified_attention(
+                        q=query[:num_decode_tokens],
+                        k=key_cache,
+                        v=value_cache,
+                        out=output[:num_decode_tokens],
+                        cu_seqlens_q=decode_meta.query_start_loc,
+                        max_seqlen_q=decode_meta.max_query_len,
+                        seqused_k=decode_meta.seq_lens,
+                        max_seqlen_k=decode_meta.max_seq_len,
+                        softmax_scale=self.scale,
+                        causal=(
+                            causal_qq_bias
+                            if tree_bias is not None
+                            else decode_meta.causal
+                        ),
+                        alibi_slopes=self.alibi_slopes,
+                        qq_bias=tree_bias,
+                        window_size=self.sliding_window,
+                        block_table=decode_meta.block_table,
+                        softcap=self.logits_soft_cap,
+                        q_descale=None,  # Not supported
+                        k_descale=layer._k_scale.expand(descale_shape),
+                        v_descale=layer._v_scale.expand(descale_shape),
+                        qq_bias_chain_prefix=qq_bias_chain_prefix,
+                    )
         return output

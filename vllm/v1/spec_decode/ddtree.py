@@ -13,9 +13,15 @@ in a single target-model forward pass using ancestor-only attention.
 
 import heapq
 import os
+import pathlib
+import time
+from collections.abc import Callable
+from contextlib import contextmanager
 
 import numpy as np
 import torch
+import triton
+import triton.language as tl
 from typing_extensions import override
 
 from vllm.config import VllmConfig
@@ -28,9 +34,374 @@ from vllm.v1.spec_decode.llm_base_proposer import SpecDecodeBaseProposer
 logger = init_logger(__name__)
 
 
+@contextmanager
+def _ddtree_profile_range(name: str, **fields):
+    if os.environ.get("DTREE_PROFILE") != "1":
+        yield
+        return
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    start = time.perf_counter()
+    try:
+        yield
+    finally:
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+        field_text = " ".join(f"{key}={value}" for key, value in fields.items())
+        logger.info("DTREE_PROFILE ddtree_%s %.3fms %s", name, elapsed_ms, field_text)
+
+
+@contextmanager
+def _ddtree_cpu_profile_range(name: str, **fields):
+    """CPU wall timer for async-boundary profiling.
+
+    Unlike DTREE_PROFILE, this intentionally does not synchronize CUDA. If a
+    .cpu(), .numpy(), or .tolist() boundary blocks on queued GPU work, the wait
+    shows up here without globally changing the stream schedule.
+    """
+    if os.environ.get("DTREE_CPU_PROFILE") != "1":
+        yield
+        return
+    start = time.perf_counter()
+    try:
+        yield
+    finally:
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+        field_text = " ".join(f"{key}={value}" for key, value in fields.items())
+        logger.info("DTREE_CPU_PROFILE ddtree_%s %.3fms %s", name, elapsed_ms, field_text)
+
+
+_SGL_DTREE_OPS_LOADED = False
+_STATIC_SIBLING_TOPOLOGY_CACHE: dict[
+    tuple[int, int, int],
+    tuple[torch.Tensor, torch.Tensor, list[int], torch.Tensor],
+] = {}
+
+
+def _load_sgl_dtree_ops() -> bool:
+    """Load SGLang's speculative tree CUDA ops if the local build exists."""
+    global _SGL_DTREE_OPS_LOADED
+    if _SGL_DTREE_OPS_LOADED:
+        return True
+    explicit = os.environ.get("DDTREE_SGL_OPS_SO")
+    candidates: list[pathlib.Path]
+    if explicit:
+        candidates = [pathlib.Path(explicit)]
+    else:
+        candidates = sorted(
+            pathlib.Path("/root/.cache/torch_extensions").glob(
+                "**/sgl_dtree_ops.so"
+            )
+        )
+    for so_path in reversed(candidates):
+        if not so_path.exists():
+            continue
+        try:
+            torch.ops.load_library(str(so_path))
+            _SGL_DTREE_OPS_LOADED = True
+            logger.info("Loaded SGLang DDTree ops from %s", so_path)
+            return True
+        except Exception as exc:
+            logger.warning("Failed to load SGLang DDTree ops from %s: %s", so_path, exc)
+    return False
+
+
+@triton.jit
+def _ddtree_verify_greedy_kernel(
+    target_predict,
+    draft_token_ids,
+    retrieve_next_token,
+    retrieve_next_sibling,
+    output,
+    gdn_state_indices,
+    budget: tl.constexpr,
+    out_stride: tl.constexpr,
+):
+    req = tl.program_id(0)
+
+    offs = tl.arange(0, 128)
+    if budget + 1 <= 128:
+        tl.store(output + req * out_stride + offs, -1, mask=offs < budget + 1)
+
+    current = tl.full((), 0, dtype=tl.int32)
+    out_pos = tl.full((), 0, dtype=tl.int32)
+    done = tl.full((), False, dtype=tl.int1)
+
+    for _ in range(0, budget + 1):
+        next_token = tl.load(target_predict + req * (budget + 1) + current)
+        child = tl.load(retrieve_next_token + req * (budget + 1) + current)
+        matched = tl.full((), -1, dtype=tl.int32)
+
+        for _sibling in range(0, budget):
+            has_child = (child >= 0) & (~done) & (matched < 0)
+            child_token = tl.load(
+                draft_token_ids + req * budget + child - 1,
+                mask=has_child,
+                other=-2147483648,
+            )
+            is_match = has_child & (child_token == next_token)
+            matched = tl.where(is_match & (matched < 0), child, matched)
+            child = tl.load(
+                retrieve_next_sibling + req * (budget + 1) + child,
+                mask=has_child & (matched < 0),
+                other=-1,
+            )
+
+        no_match = (matched < 0) & (~done)
+        if no_match:
+            tl.store(output + req * out_stride + out_pos, next_token)
+            tl.store(gdn_state_indices + req, current + 1)
+            done = True
+
+        has_match = (matched >= 0) & (~done)
+        if has_match:
+            tl.store(output + req * out_stride + out_pos, next_token)
+            out_pos += 1
+            current = matched
+
+
+def build_retrieve_from_child_maps(
+    child_maps: list[list[dict[int, int]]],
+    budget: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build SGLang-style linked-child retrieval tables for DDTree verify."""
+    batch_size = len(child_maps)
+    retrieve_next_token = torch.full(
+        (batch_size, budget + 1), -1, dtype=torch.int32, device=device
+    )
+    retrieve_next_sibling = torch.full(
+        (batch_size, budget + 1), -1, dtype=torch.int32, device=device
+    )
+    for r, maps in enumerate(child_maps):
+        for parent_idx, children in enumerate(maps[: budget + 1]):
+            previous_child = -1
+            for child_idx in children.values():
+                child_idx = int(child_idx)
+                if previous_child < 0:
+                    retrieve_next_token[r, parent_idx] = child_idx
+                else:
+                    retrieve_next_sibling[r, previous_child] = child_idx
+                previous_child = child_idx
+    return retrieve_next_token, retrieve_next_sibling
+
+
+def _build_visibility_from_parents(parents: np.ndarray) -> torch.Tensor:
+    # visibility[i, j] == True iff j is an ancestor of i or j == i.
+    current_length = int(len(parents))
+    visibility_np = np.zeros((current_length, current_length), dtype=np.bool_)
+    visibility_np[0, 0] = True
+    for idx in range(1, current_length):
+        p_idx = int(parents[idx])
+        visibility_np[idx, :idx] = visibility_np[p_idx, :idx]
+        visibility_np[idx, idx] = True
+    return torch.from_numpy(visibility_np)
+
+
+def _build_static_sibling_child_maps(
+    chain_len: int,
+    branch_count: int,
+) -> list[dict[int, int]]:
+    """Index-only child maps for the static chain+siblings topology.
+
+    The GPU verifier uses only child indices from these maps; token matching is
+    done against the GPU draft-token tensor.  Dummy keys deliberately avoid a
+    proposal-time GPU->CPU token sync in the static fast path.
+    """
+    total_nodes = chain_len + branch_count
+    child_maps: list[dict[int, int]] = [{} for _ in range(total_nodes + 1)]
+    parent_index = 0
+    for depth in range(1, chain_len + 1):
+        current_index = depth
+        child_maps[parent_index][-current_index] = current_index
+        parent_index = current_index
+    for depth in range(1, branch_count + 1):
+        current_index = chain_len + depth
+        parent_index = depth - 1
+        child_maps[parent_index][-current_index] = current_index
+    return child_maps
+
+
+def resolve_ddtree_candidate_topk(
+    budget: int,
+    vocab_size: int,
+    force_chain_prefix: int = 0,
+) -> int:
+    """Resolve how many draft candidates to materialize per depth.
+
+    Explicit DDTREE_CANDIDATE_TOPK keeps its old override semantics.  For the
+    latency-critical DDTree-15 shape used by the competition stack, the tree
+    reserves a long top-1 chain and spends only a few nodes on branches.  A
+    full top-15 slice is unnecessary proposer work and empirically slower than
+    top-12 while producing the same exact verifier semantics.
+    """
+    candidate_topk = int(os.environ.get("DDTREE_CANDIDATE_TOPK", "0") or "0")
+    if candidate_topk <= 0 and budget == 15 and force_chain_prefix >= 12:
+        candidate_topk = 12
+    if candidate_topk <= 0:
+        candidate_topk = budget
+    return min(candidate_topk, budget, vocab_size)
+
+
+def should_use_ddtree_for_prompt_lens(prompt_lens) -> bool:
+    """Return whether DDTree should run for this request batch.
+
+    The current DDTree path wins on short prompts but loses on medium/long
+    prompts on the A10 stack.  Keep the threshold environment-controlled so the
+    gate is easy to disable or retune without changing code.
+    """
+    threshold = int(os.environ.get("DDTREE_MAX_PROMPT_TOKENS", "0") or "0")
+    if threshold <= 0:
+        return True
+    return all(int(length) <= threshold for length in prompt_lens)
+
+
+def _build_forced_chain_tail_tree_fast(
+    top_token_ids_np: np.ndarray,
+    top_log_probs_np: np.ndarray,
+    budget: int,
+    depth_limit: int,
+    force_chain_prefix: int,
+    topk: int,
+):
+    """Specialized builder for the competition's chain+small-tail shape."""
+    if (
+        os.environ.get("DDTREE_ENABLE_FAST_CHAIN") != "1"
+        or budget != 15
+        or force_chain_prefix < 12
+        or topk <= 1
+        or depth_limit < 12
+    ):
+        return None
+
+    chain_len = max(0, min(int(force_chain_prefix), budget, depth_limit))
+    if budget - chain_len != 3:
+        return None
+
+    node_token_ids_np = np.empty(budget, dtype=np.int64)
+    node_depths_np = np.empty(budget, dtype=np.int64)
+    node_ranks_np = np.empty(budget, dtype=np.int64)
+    parents_np = np.empty(budget + 1, dtype=np.int32)
+    parents_np[0] = -1
+    child_maps: list[dict[int, int]] = [{}]
+    path_logw_by_index = [0.0]
+    path_ranks_by_index: list[tuple[int, ...]] = [()]
+    added_keys: set[tuple[int, int, int]] = set()
+    node_count = 0
+
+    def add_node(
+        parent_index: int,
+        depth: int,
+        rank: int,
+        logw: float,
+        ranks: tuple[int, ...],
+    ) -> int:
+        nonlocal node_count
+        token_id = int(top_token_ids_np[depth - 1, rank])
+        current_index = node_count + 1
+        node_token_ids_np[node_count] = token_id
+        node_depths_np[node_count] = depth
+        node_ranks_np[node_count] = rank
+        parents_np[current_index] = parent_index
+        child_maps.append({})
+        child_maps[parent_index][token_id] = current_index
+        path_logw_by_index.append(logw)
+        path_ranks_by_index.append(ranks)
+        added_keys.add((parent_index, depth, rank))
+        node_count += 1
+        return current_index
+
+    parent_index = 0
+    logw = 0.0
+    ranks: tuple[int, ...] = ()
+    forced_node_indices: list[int] = []
+    for depth in range(1, chain_len + 1):
+        logw += float(top_log_probs_np[depth - 1, 0])
+        ranks = ranks + (0,)
+        parent_index = add_node(parent_index, depth, 0, logw, ranks)
+        forced_node_indices.append(parent_index)
+
+    candidates: list[tuple[float, tuple[int, ...], int, int, int, float]] = []
+
+    def push_candidate(
+        parent: int,
+        depth: int,
+        rank: int,
+        cand_logw: float,
+        cand_ranks: tuple[int, ...],
+    ) -> None:
+        if depth > depth_limit or rank >= topk:
+            return
+        if (parent, depth, rank) in added_keys:
+            return
+        candidates.append((-cand_logw, cand_ranks, parent, depth, rank, cand_logw))
+
+    for node_index in forced_node_indices:
+        depth = int(node_depths_np[node_index - 1])
+        parent = int(parents_np[node_index])
+        parent_logw = path_logw_by_index[parent]
+        parent_ranks = path_ranks_by_index[parent]
+        push_candidate(
+            parent,
+            depth,
+            1,
+            parent_logw + float(top_log_probs_np[depth - 1, 1]),
+            parent_ranks + (1,),
+        )
+    if chain_len < depth_limit:
+        push_candidate(
+            parent_index,
+            chain_len + 1,
+            0,
+            logw + float(top_log_probs_np[chain_len, 0]),
+            ranks + (0,),
+        )
+
+    while candidates and node_count < budget:
+        best = min(range(len(candidates)), key=candidates.__getitem__)
+        _, ranks, parent_index, depth, rank, logw = candidates.pop(best)
+        token_id = int(top_token_ids_np[depth - 1, rank])
+        if (parent_index, depth, rank) in added_keys:
+            continue
+        if token_id in child_maps[parent_index]:
+            continue
+        current_index = add_node(parent_index, depth, rank, logw, ranks)
+
+        if rank + 1 < topk:
+            parent_logw = path_logw_by_index[parent_index]
+            push_candidate(
+                parent_index,
+                depth,
+                rank + 1,
+                parent_logw + float(top_log_probs_np[depth - 1, rank + 1]),
+                path_ranks_by_index[parent_index] + (rank + 1,),
+            )
+        if depth < depth_limit:
+            push_candidate(
+                current_index,
+                depth + 1,
+                0,
+                logw + float(top_log_probs_np[depth, 0]),
+                ranks + (0,),
+            )
+
+    current_length = 1 + node_count
+    parents_view = parents_np[:current_length]
+    return (
+        torch.from_numpy(node_token_ids_np[:node_count]),
+        torch.from_numpy(node_depths_np[:node_count]),
+        torch.from_numpy(node_ranks_np[:node_count]),
+        parents_view.tolist(),
+        child_maps,
+        _build_visibility_from_parents(parents_view),
+    )
+
+
 def build_ddtree_tree(
     draft_logits: torch.Tensor,
     budget: int,
+    force_chain_prefix: int = 0,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -49,6 +420,8 @@ def build_ddtree_tree(
             Raw (un-softmaxed) logits for each speculative position,
             as produced by the DFlash draft model.
         budget: Maximum number of non-root tree nodes to expand.
+        force_chain_prefix: Number of leading top-1 chain nodes to reserve
+            before spending the remaining budget on best-first branches.
 
     Returns:
         node_token_ids: int64[num_nodes] — token id at each non-root node.
@@ -72,17 +445,187 @@ def build_ddtree_tree(
         )
 
     depth_limit = int(draft_logits.shape[0])
-    topk = min(budget, draft_logits.shape[-1])
+    static_siblings = int(os.environ.get("DDTREE_STATIC_SIBLINGS", "0") or "0")
+    if static_siblings > 0:
+        chain_len = max(0, min(int(force_chain_prefix), budget, depth_limit))
+        branch_count = max(0, min(static_siblings, budget - chain_len, chain_len))
+        total_nodes = chain_len + branch_count
+        topology_key = (chain_len, branch_count, total_nodes)
+        gpu_static_tree = (
+            os.environ.get("DDTREE_GPU_STATIC_TREE") == "1"
+            and os.environ.get("DDTREE_SGL_VERIFY") == "1"
+            and total_nodes == budget
+            and branch_count > 0
+        )
+        with _ddtree_cpu_profile_range("static_top1_argmax", rows=depth_limit):
+            top1_ids = draft_logits.argmax(dim=-1)
+        if branch_count > 0 and draft_logits.shape[-1] > 1:
+            with _ddtree_cpu_profile_range("static_branch_top2", rows=branch_count):
+                branch_top2_ids = torch.topk(
+                    draft_logits[:branch_count].float(), k=2, dim=-1
+                ).indices
+        else:
+            branch_top2_ids = None
+        if gpu_static_tree and branch_top2_ids is not None:
+            node_token_ids = torch.cat(
+                [top1_ids[:chain_len], branch_top2_ids[:branch_count, 1]], dim=0
+            ).to(dtype=torch.long)
+            cached = _STATIC_SIBLING_TOPOLOGY_CACHE.get(topology_key)
+            if cached is None:
+                node_depths_np = np.concatenate(
+                    [
+                        np.arange(1, chain_len + 1, dtype=np.int64),
+                        np.arange(1, branch_count + 1, dtype=np.int64),
+                    ]
+                )
+                node_ranks_np = np.concatenate(
+                    [
+                        np.zeros(chain_len, dtype=np.int64),
+                        np.ones(branch_count, dtype=np.int64),
+                    ]
+                )
+                parents_np = np.empty(total_nodes + 1, dtype=np.int32)
+                parents_np[0] = -1
+                for depth in range(1, chain_len + 1):
+                    parents_np[depth] = depth - 1
+                for depth in range(1, branch_count + 1):
+                    parents_np[chain_len + depth] = depth - 1
+                node_depths = torch.from_numpy(node_depths_np)
+                node_ranks = torch.from_numpy(node_ranks_np)
+                parents_list = parents_np.tolist()
+                visibility = _build_visibility_from_parents(parents_np)
+                cached = (node_depths, node_ranks, parents_list, visibility)
+                _STATIC_SIBLING_TOPOLOGY_CACHE[topology_key] = cached
+            node_depths, node_ranks, parents_list, visibility = cached
+            return (
+                node_token_ids,
+                node_depths,
+                node_ranks,
+                parents_list,
+                _build_static_sibling_child_maps(chain_len, branch_count),
+                visibility,
+            )
+        with _ddtree_cpu_profile_range("static_top1_d2h", rows=depth_limit):
+            top1_ids_np = top1_ids.to(device="cpu", dtype=torch.long).numpy()
+        with _ddtree_cpu_profile_range("static_branch_d2h", rows=branch_count):
+            branch_top2_ids_np = (
+                branch_top2_ids.to(device="cpu", dtype=torch.long).numpy()
+                if branch_top2_ids is not None
+                else None
+            )
+        node_token_ids_np = np.empty(total_nodes, dtype=np.int64)
+        node_depths_np = np.empty(total_nodes, dtype=np.int64)
+        node_ranks_np = np.empty(total_nodes, dtype=np.int64)
+        parents_np = np.empty(total_nodes + 1, dtype=np.int32)
+        parents_np[0] = -1
+        child_maps: list[dict[int, int]] = [{}]
+
+        parent_index = 0
+        with _ddtree_cpu_profile_range("static_python_tree", rows=total_nodes):
+            for depth in range(1, chain_len + 1):
+                current_index = depth
+                token_id = int(top1_ids_np[depth - 1])
+                node_token_ids_np[current_index - 1] = token_id
+                node_depths_np[current_index - 1] = depth
+                node_ranks_np[current_index - 1] = 0
+                parents_np[current_index] = parent_index
+                child_maps.append({})
+                child_maps[parent_index][token_id] = current_index
+                parent_index = current_index
+
+            node_count = chain_len
+            for depth in range(1, branch_count + 1):
+                if branch_top2_ids_np is None:
+                    break
+                parent_index = depth - 1
+                token_id = int(branch_top2_ids_np[depth - 1, 1])
+                if token_id in child_maps[parent_index]:
+                    continue
+                node_count += 1
+                current_index = node_count
+                node_token_ids_np[current_index - 1] = token_id
+                node_depths_np[current_index - 1] = depth
+                node_ranks_np[current_index - 1] = 1
+                parents_np[current_index] = parent_index
+                child_maps.append({})
+                child_maps[parent_index][token_id] = current_index
+
+        if node_count == total_nodes:
+            cached = _STATIC_SIBLING_TOPOLOGY_CACHE.get(topology_key)
+            if cached is None:
+                node_depths = torch.from_numpy(node_depths_np[:node_count].copy())
+                node_ranks = torch.from_numpy(node_ranks_np[:node_count].copy())
+                parents_list = parents_np[: node_count + 1].tolist()
+                visibility = _build_visibility_from_parents(
+                    parents_np[: node_count + 1]
+                )
+                cached = (node_depths, node_ranks, parents_list, visibility)
+                _STATIC_SIBLING_TOPOLOGY_CACHE[topology_key] = cached
+            node_depths, node_ranks, parents_list, visibility = cached
+        else:
+            parents_view = parents_np[: node_count + 1]
+            node_depths = torch.from_numpy(node_depths_np[:node_count])
+            node_ranks = torch.from_numpy(node_ranks_np[:node_count])
+            parents_list = parents_view.tolist()
+            visibility = _build_visibility_from_parents(parents_view)
+        return (
+            torch.from_numpy(node_token_ids_np[:node_count]),
+            node_depths,
+            node_ranks,
+            parents_list,
+            child_maps,
+            visibility,
+        )
+
+    topk = resolve_ddtree_candidate_topk(
+        budget=budget,
+        vocab_size=draft_logits.shape[-1],
+        force_chain_prefix=force_chain_prefix,
+    )
 
     # Compute normalised log-probabilities for the top-k tokens at each
-    # position.  Move to CPU immediately; the heap runs on the CPU.
-    logits = draft_logits.float()
-    top_logits, top_token_ids = torch.topk(logits, k=topk, dim=-1)
-    log_z = torch.logsumexp(logits, dim=-1, keepdim=True)
-    top_log_probs_np = (
-        (top_logits - log_z).to(device="cpu", dtype=torch.float32).numpy()
+    # position.  Move to CPU immediately; the heap runs on the CPU.  For the
+    # top-k-logZ fast path, avoid upcasting the full vocab matrix to fp32.
+    if os.environ.get("DDTREE_TOPK_LOGZ") == "1" or os.environ.get("DDTREE_SKIP_LOGZ") == "1":
+        with _ddtree_cpu_profile_range("generic_topk", rows=depth_limit, topk=topk):
+            top_logits, top_token_ids = torch.topk(draft_logits, k=topk, dim=-1)
+        top_logits = top_logits.float()
+        if os.environ.get("DDTREE_SKIP_LOGZ") == "1":
+            with _ddtree_cpu_profile_range("generic_logprob_d2h", rows=depth_limit, topk=topk):
+                top_log_probs_np = top_logits.to(device="cpu", dtype=torch.float32).numpy()
+        else:
+            # Fast proposal-only approximation: use the already materialized top-k
+            # slice to normalize branch scores instead of scanning the full vocab.
+            # Verification remains exact; this only affects which candidate nodes
+            # are selected for the fixed tree budget.
+            with _ddtree_cpu_profile_range("generic_topk_logz", rows=depth_limit, topk=topk):
+                log_z = torch.logsumexp(top_logits, dim=-1, keepdim=True)
+                top_log_probs = top_logits - log_z
+            with _ddtree_cpu_profile_range("generic_logprob_d2h", rows=depth_limit, topk=topk):
+                top_log_probs_np = top_log_probs.to(device="cpu", dtype=torch.float32).numpy()
+    else:
+        with _ddtree_cpu_profile_range("generic_float_full", rows=depth_limit):
+            logits = draft_logits.float()
+        with _ddtree_cpu_profile_range("generic_topk", rows=depth_limit, topk=topk):
+            top_logits, top_token_ids = torch.topk(logits, k=topk, dim=-1)
+        with _ddtree_cpu_profile_range("generic_full_logz", rows=depth_limit):
+            log_z = torch.logsumexp(logits, dim=-1, keepdim=True)
+            top_log_probs = top_logits - log_z
+        with _ddtree_cpu_profile_range("generic_logprob_d2h", rows=depth_limit, topk=topk):
+            top_log_probs_np = top_log_probs.to(device="cpu", dtype=torch.float32).numpy()
+    with _ddtree_cpu_profile_range("generic_token_d2h", rows=depth_limit, topk=topk):
+        top_token_ids_np = top_token_ids.to(device="cpu", dtype=torch.long).numpy()
+
+    fast_tree = _build_forced_chain_tail_tree_fast(
+        top_token_ids_np=top_token_ids_np,
+        top_log_probs_np=top_log_probs_np,
+        budget=budget,
+        depth_limit=depth_limit,
+        force_chain_prefix=force_chain_prefix,
+        topk=topk,
     )
-    top_token_ids_np = top_token_ids.to(device="cpu", dtype=torch.long).numpy()
+    if fast_tree is not None:
+        return fast_tree
 
     node_token_ids_np = np.empty(budget, dtype=np.int64)
     node_depths_np = np.empty(budget, dtype=np.int64)
@@ -92,6 +635,9 @@ def build_ddtree_tree(
     parents_np = np.empty(budget + 1, dtype=np.int32)
     parents_np[0] = -1
     child_maps: list[dict[int, int]] = [{}]
+    path_logw_by_index = [0.0]
+    path_ranks_by_index: list[tuple[int, ...]] = [()]
+    added_keys: set[tuple[int, int, int]] = set()
     node_count = 0
 
     # Best-first heap. Each entry is a candidate node not yet added to the tree.
@@ -110,11 +656,16 @@ def build_ddtree_tree(
     #   logw         — accumulated path log-prob (non-negated); kept separately
     #                  so sibling/child expansions can do arithmetic on the raw
     #                  sum without re-extracting it from the negated first field
-    first_logw = float(top_log_probs_np[0, 0])
-    heap: list[tuple] = [(-first_logw, (0,), 0, 1, 0, first_logw)]
+    heap: list[tuple] = []
 
-    while heap and node_count < budget:
-        _, ranks, parent_index, depth, rank, logw = heapq.heappop(heap)
+    def add_node(
+        parent_index: int,
+        depth: int,
+        rank: int,
+        logw: float,
+        ranks: tuple[int, ...],
+    ) -> int:
+        nonlocal node_count
         token_id = int(top_token_ids_np[depth - 1, rank])
         current_index = node_count + 1
 
@@ -124,61 +675,159 @@ def build_ddtree_tree(
         parents_np[current_index] = parent_index
         child_maps.append({})
         child_maps[parent_index][token_id] = current_index
+        path_logw_by_index.append(logw)
+        path_ranks_by_index.append(ranks)
+        added_keys.add((parent_index, depth, rank))
         node_count += 1
+        return current_index
+
+    def push_candidate(
+        parent_index: int,
+        depth: int,
+        rank: int,
+        logw: float,
+        ranks: tuple[int, ...],
+    ) -> None:
+        if depth > depth_limit or rank >= topk:
+            return
+        if (parent_index, depth, rank) in added_keys:
+            return
+        heapq.heappush(heap, (-logw, ranks, parent_index, depth, rank, logw))
+
+    force_chain_len = max(0, min(int(force_chain_prefix), budget, depth_limit))
+    parent_index = 0
+    logw = 0.0
+    ranks: tuple[int, ...] = ()
+    forced_node_indices: list[int] = []
+    for depth in range(1, force_chain_len + 1):
+        logw += float(top_log_probs_np[depth - 1, 0])
+        ranks = ranks + (0,)
+        parent_index = add_node(parent_index, depth, 0, logw, ranks)
+        forced_node_indices.append(parent_index)
+
+    root_siblings = int(os.environ.get("DDTREE_ROOT_SIBLINGS", "0") or "0")
+    if (
+        root_siblings > 0
+        and force_chain_len > 0
+        and depth_limit > 0
+        and node_count < budget
+    ):
+        max_rank = min(topk, root_siblings + 1)
+        for rank in range(1, max_rank):
+            if node_count >= budget:
+                break
+            token_id = int(top_token_ids_np[0, rank])
+            if token_id in child_maps[0]:
+                continue
+            add_node(
+                0,
+                1,
+                rank,
+                float(top_log_probs_np[0, rank]),
+                (rank,),
+            )
+        return (
+            torch.from_numpy(node_token_ids_np[:node_count]),
+            torch.from_numpy(node_depths_np[:node_count]),
+            torch.from_numpy(node_ranks_np[:node_count]),
+            parents_np[: node_count + 1].tolist(),
+            child_maps,
+            _build_visibility_from_parents(parents_np[: node_count + 1]),
+        )
+
+    if (
+        os.environ.get("DDTREE_ALT_ROOT_CHAIN") == "1"
+        and node_count < budget
+        and depth_limit > 0
+        and topk > 1
+    ):
+        alt_parent = 0
+        alt_logw = float(top_log_probs_np[0, 1])
+        alt_ranks: tuple[int, ...] = (1,)
+        alt_parent = add_node(alt_parent, 1, 1, alt_logw, alt_ranks)
+        for depth in range(2, depth_limit + 1):
+            if node_count >= budget:
+                break
+            alt_logw += float(top_log_probs_np[depth - 1, 0])
+            alt_ranks = alt_ranks + (0,)
+            alt_parent = add_node(alt_parent, depth, 0, alt_logw, alt_ranks)
+        heap.clear()
+        return (
+            torch.from_numpy(node_token_ids_np[:node_count]),
+            torch.from_numpy(node_depths_np[:node_count]),
+            torch.from_numpy(node_ranks_np[:node_count]),
+            parents_np[: node_count + 1].tolist(),
+            child_maps,
+            _build_visibility_from_parents(parents_np[: node_count + 1]),
+        )
+
+    if force_chain_len == 0:
+        first_logw = float(top_log_probs_np[0, 0])
+        push_candidate(0, 1, 0, first_logw, (0,))
+    else:
+        # Seed branches off every forced-chain parent, then let the same
+        # best-first expansion fill the remaining budget. This preserves the
+        # flat DFlash top-1 chain floor while still allocating extra nodes to
+        # high-probability alternatives.
+        for node_index in forced_node_indices:
+            depth = int(node_depths_np[node_index - 1])
+            parent = int(parents_np[node_index])
+            parent_logw = path_logw_by_index[parent]
+            parent_ranks = path_ranks_by_index[parent]
+            if 1 < topk:
+                push_candidate(
+                    parent,
+                    depth,
+                    1,
+                    parent_logw + float(top_log_probs_np[depth - 1, 1]),
+                    parent_ranks + (1,),
+                )
+        if force_chain_len < depth_limit:
+            push_candidate(
+                parent_index,
+                force_chain_len + 1,
+                0,
+                logw + float(top_log_probs_np[force_chain_len, 0]),
+                ranks + (0,),
+            )
+
+    while heap and node_count < budget:
+        _, ranks, parent_index, depth, rank, logw = heapq.heappop(heap)
+        token_id = int(top_token_ids_np[depth - 1, rank])
+        if (parent_index, depth, rank) in added_keys:
+            continue
+        if token_id in child_maps[parent_index]:
+            continue
+        current_index = add_node(parent_index, depth, rank, logw, ranks)
 
         # Push sibling: same parent, next rank at the same depth.
         if rank + 1 < topk:
-            sibling_logw = (
-                logw
-                - float(top_log_probs_np[depth - 1, rank])
-                + float(top_log_probs_np[depth - 1, rank + 1])
+            parent_logw = path_logw_by_index[parent_index]
+            sibling_logw = parent_logw + float(
+                top_log_probs_np[depth - 1, rank + 1]
             )
-            heapq.heappush(
-                heap,
-                (
-                    -sibling_logw,
-                    ranks[:-1] + (rank + 1,),
-                    parent_index,
-                    depth,
-                    rank + 1,
-                    sibling_logw,
-                ),
+            push_candidate(
+                parent_index,
+                depth,
+                rank + 1,
+                sibling_logw,
+                path_ranks_by_index[parent_index] + (rank + 1,),
             )
 
         # Push first child: go one level deeper, take rank-0 token.
         if depth < depth_limit:
             child_logw = logw + float(top_log_probs_np[depth, 0])
-            heapq.heappush(
-                heap,
-                (
-                    -child_logw,
-                    ranks + (0,),
-                    current_index,
-                    depth + 1,
-                    0,
-                    child_logw,
-                ),
-            )
+            push_candidate(current_index, depth + 1, 0, child_logw, ranks + (0,))
 
-    # Build the ancestor-only visibility (attention) mask.
-    # visibility[i, j] == True  iff  j is an ancestor of i (or j == i).
     current_length = 1 + node_count
-    visibility_np = np.zeros((current_length, current_length), dtype=np.bool_)
-    visibility_np[0, 0] = True
-    for idx in range(1, current_length):
-        p = int(parents_np[idx])
-        visibility_np[idx, :idx] = visibility_np[p, :idx]
-        visibility_np[idx, idx] = True
-
     return (
         torch.from_numpy(node_token_ids_np[:node_count]),
         torch.from_numpy(node_depths_np[:node_count]),
         torch.from_numpy(node_ranks_np[:node_count]),
         parents_np[:current_length].tolist(),
         child_maps,
-        torch.from_numpy(visibility_np),
+        _build_visibility_from_parents(parents_np[:current_length]),
     )
-
 
 def follow_verified_tree(
     child_maps: list[dict[int, int]],
@@ -214,6 +863,133 @@ def follow_verified_tree(
     return accepted_indices, next_token
 
 
+
+@triton.jit
+def _ddtree_lm_head_argmax_kernel(
+    hidden_ptr,
+    weight_ptr,
+    local_max_ptr,
+    local_idx_ptr,
+    n_rows: tl.constexpr,
+    hidden_size: tl.constexpr,
+    vocab_size: tl.constexpr,
+    org_vocab_size: tl.constexpr,
+    hidden_stride0: tl.constexpr,
+    hidden_stride1: tl.constexpr,
+    weight_stride0: tl.constexpr,
+    weight_stride1: tl.constexpr,
+    local_stride0: tl.constexpr,
+    block_v: tl.constexpr,
+    block_h: tl.constexpr,
+):
+    row = tl.program_id(0)
+    block = tl.program_id(1)
+    offs_v = block * block_v + tl.arange(0, block_v)
+    offs_h = tl.arange(0, block_h)
+    acc = tl.zeros((block_v,), dtype=tl.float32)
+
+    for h0 in range(0, hidden_size, block_h):
+        h_idx = h0 + offs_h
+        h = tl.load(
+            hidden_ptr + row * hidden_stride0 + h_idx * hidden_stride1,
+            mask=h_idx < hidden_size,
+            other=0.0,
+        ).to(tl.float32)
+        w = tl.load(
+            weight_ptr
+            + offs_v[:, None] * weight_stride0
+            + h_idx[None, :] * weight_stride1,
+            mask=(offs_v[:, None] < vocab_size) & (h_idx[None, :] < hidden_size),
+            other=0.0,
+        ).to(tl.float32)
+        acc += tl.sum(w * h[None, :], axis=1)
+
+    acc = tl.where(offs_v < org_vocab_size, acc, -float("inf"))
+    max_val = tl.max(acc, axis=0)
+    winner = tl.min(tl.where(acc == max_val, offs_v, vocab_size + block_v), axis=0)
+    tl.store(local_max_ptr + row * local_stride0 + block, max_val)
+    tl.store(local_idx_ptr + row * local_stride0 + block, winner)
+
+
+def ddtree_fused_lm_head_argmax(
+    lm_head: torch.nn.Module,
+    logits_processor: torch.nn.Module,
+    hidden_states: torch.Tensor,
+) -> torch.Tensor | None:
+    weight = getattr(lm_head, "weight", None)
+    bias = getattr(lm_head, "bias", None)
+    if weight is None or bias is not None:
+        return None
+    if not hidden_states.is_cuda or not weight.is_cuda:
+        return None
+    if hidden_states.dtype not in (torch.float16, torch.bfloat16):
+        return None
+    if weight.dtype not in (torch.float16, torch.bfloat16):
+        return None
+    if hidden_states.shape[-1] != weight.shape[-1]:
+        return None
+    scale = getattr(logits_processor, "scale", 1.0)
+    if scale <= 0.0 and scale != 1.0:
+        return None
+
+    hidden = hidden_states.contiguous()
+    weight = weight.contiguous()
+    n_rows = int(hidden.shape[0])
+    hidden_size = int(hidden.shape[1])
+    vocab_size = int(weight.shape[0])
+    org_vocab_size = int(getattr(logits_processor, "org_vocab_size", vocab_size))
+    if n_rows == 0:
+        return torch.empty(0, dtype=torch.long, device=hidden.device)
+
+    block_v = int(os.environ.get("DDTREE_FUSED_ARGMAX_BLOCK_V", "64"))
+    block_h = int(os.environ.get("DDTREE_FUSED_ARGMAX_BLOCK_H", "64"))
+    num_blocks = triton.cdiv(vocab_size, block_v)
+    local_max = torch.empty((n_rows, num_blocks), dtype=torch.float32, device=hidden.device)
+    local_idx = torch.empty((n_rows, num_blocks), dtype=torch.int64, device=hidden.device)
+    _ddtree_lm_head_argmax_kernel[(n_rows, num_blocks)](
+        hidden,
+        weight,
+        local_max,
+        local_idx,
+        n_rows,
+        hidden_size,
+        vocab_size,
+        org_vocab_size,
+        hidden.stride(0),
+        hidden.stride(1),
+        weight.stride(0),
+        weight.stride(1),
+        local_max.stride(0),
+        block_v,
+        block_h,
+        num_warps=4,
+    )
+    block_ids = local_max.argmax(dim=-1, keepdim=True)
+    return local_idx.gather(1, block_ids).squeeze(1).to(torch.long)
+
+
+def ddtree_verify_argmax_ids(
+    posterior_token_ids: torch.Tensor,
+    draft_token_ids: torch.Tensor,
+    child_maps: list[list[dict[int, int]]],
+    budget: int,
+    batch_size: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    posterior_cpu = posterior_token_ids.view(batch_size, budget + 1).cpu().tolist()
+    draft_tokens_cpu = draft_token_ids.view(batch_size, budget).cpu().tolist()
+    output = torch.full((batch_size, budget + 1), -1, dtype=torch.int32)
+    gdn_state_indices = torch.ones(batch_size, dtype=torch.int32)
+    for r in range(batch_size):
+        accepted_indices, bonus_token = follow_verified_tree(child_maps[r], posterior_cpu[r])
+        gdn_state_indices[r] = int(accepted_indices[-1]) + 1
+        out_pos = 0
+        for node_idx in accepted_indices[1:]:
+            output[r, out_pos] = draft_tokens_cpu[r][node_idx - 1]
+            out_pos += 1
+        output[r, out_pos] = int(bonus_token)
+    return output.to(device), gdn_state_indices.to(device)
+
 def ddtree_verify(
     logits: torch.Tensor,
     target_logits_indices: torch.Tensor,
@@ -223,7 +999,8 @@ def ddtree_verify(
     budget: int,
     batch_size: int,
     device: torch.device,
-) -> torch.Tensor:
+    return_gdn_state_indices: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Tree-aware verification for DDTree speculative decoding.
 
     After the target model's forward pass over all tree nodes (with
@@ -270,24 +1047,33 @@ def ddtree_verify(
     )
     bonus_posterior = logits[bonus_logits_indices].argmax(dim=-1)
 
-    node_posterior_cpu = node_posterior.cpu().tolist()
-    bonus_posterior_cpu = bonus_posterior.cpu().tolist()
-    draft_tokens_cpu = draft_token_ids.view(batch_size, budget).cpu().tolist()
+    with _ddtree_cpu_profile_range("verify_node_posterior_d2h", batch=batch_size, budget=budget):
+        node_posterior_cpu = node_posterior.cpu().tolist()
+    with _ddtree_cpu_profile_range("verify_bonus_d2h", batch=batch_size):
+        bonus_posterior_cpu = bonus_posterior.cpu().tolist()
+    with _ddtree_cpu_profile_range("verify_draft_tokens_d2h", batch=batch_size, budget=budget):
+        draft_tokens_cpu = draft_token_ids.view(batch_size, budget).cpu().tolist()
 
     _dbg = os.environ.get("DDTREE_DEBUG") == "1"
 
     output = torch.full((batch_size, budget + 1), -1, dtype=torch.int32)
+    gdn_state_indices = torch.ones(batch_size, dtype=torch.int32)
 
     for r in range(batch_size):
         posterior = node_posterior_cpu[r] + [bonus_posterior_cpu[r]]
 
         accepted_indices, bonus_token = follow_verified_tree(child_maps[r], posterior)
+        # GDN/Mamba speculative state slots are indexed by tree node, not by
+        # accepted-path length. For a flat chain those are identical; for a
+        # branched tree, the accepted leaf can live at any node index.
+        gdn_state_indices[r] = int(accepted_indices[-1]) + 1
 
         if _dbg and r == 0:
             print(
                 f"[ddtree_verify] draft={draft_tokens_cpu[r]}"
                 f" posterior={posterior[:budget]}"
                 f" acc_len={len(accepted_indices)}"
+                f" gdn_state_idx={int(gdn_state_indices[r])}"
                 f" maps={child_maps[r]}"
             )
 
@@ -297,7 +1083,203 @@ def ddtree_verify(
             out_pos += 1
         output[r, out_pos] = bonus_token
 
-    return output.to(device)
+        with _ddtree_cpu_profile_range("verify_output_h2d", batch=batch_size, budget=budget):
+            output = output.to(device)
+        if return_gdn_state_indices:
+            with _ddtree_cpu_profile_range("verify_gdn_h2d", batch=batch_size):
+                gdn_state_indices = gdn_state_indices.to(device)
+            return output, gdn_state_indices
+        return output
+
+
+def ddtree_verify_sglang_greedy(
+    logits: torch.Tensor,
+    target_logits_indices: torch.Tensor,
+    bonus_logits_indices: torch.Tensor,
+    draft_token_ids: torch.Tensor,
+    child_maps: list[list[dict[int, int]]],
+    budget: int,
+    batch_size: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """SGLang greedy tree verification using linked child/sibling tables.
+
+    The preferred path loads SGLang's CUDA implementation of
+    ``verify_tree_greedy``.  The local Triton kernel is kept only as a
+    development fallback because the CUDA op is the behavior we want to port.
+    """
+    node_posterior = logits[target_logits_indices].argmax(dim=-1).view(
+        batch_size, budget
+    )
+    bonus_posterior = logits[bonus_logits_indices].argmax(dim=-1).view(batch_size, 1)
+    target_predict = torch.cat([node_posterior, bonus_posterior], dim=1).to(
+        dtype=torch.int64
+    )
+    draft_tokens = draft_token_ids.view(batch_size, budget).to(dtype=torch.int64)
+    retrieve_next_token_i32, retrieve_next_sibling_i32 = build_retrieve_from_child_maps(
+        child_maps, budget, device
+    )
+
+    output = torch.full(
+        (batch_size, budget + 1), -1, dtype=torch.int32, device=device
+    )
+    gdn_state_indices = torch.empty(batch_size, dtype=torch.int32, device=device)
+
+    if _load_sgl_dtree_ops():
+        candidates = torch.cat(
+            [
+                torch.full(
+                    (batch_size, 1),
+                    -1,
+                    dtype=torch.int64,
+                    device=device,
+                ),
+                draft_tokens,
+            ],
+            dim=1,
+        )
+        retrieve_index = torch.arange(
+            batch_size * (budget + 1), dtype=torch.int64, device=device
+        ).view(batch_size, budget + 1)
+        accept_index = torch.full(
+            (batch_size, budget + 1), -1, dtype=torch.int32, device=device
+        )
+        accept_token_num = torch.empty(batch_size, dtype=torch.int32, device=device)
+        predicts = torch.full(
+            (batch_size * (budget + 1),), -1, dtype=torch.int32, device=device
+        )
+        torch.ops.sgl_dtree.verify_tree_greedy(
+            predicts,
+            accept_index,
+            accept_token_num,
+            candidates,
+            retrieve_index,
+            retrieve_next_token_i32.to(dtype=torch.int64),
+            retrieve_next_sibling_i32.to(dtype=torch.int64),
+            target_predict,
+        )
+        # SGLang writes accepted row ids into ``accept_index``. Convert back
+        # to vLLM's [accepted draft tokens..., bonus token, -1...] convention
+        # without CPU synchronization.
+        row_offsets = (
+            torch.arange(batch_size, dtype=torch.int32, device=device) * (budget + 1)
+        ).view(batch_size, 1)
+        accepted_rows_i32 = accept_index - row_offsets
+        accepted_rows = accepted_rows_i32.clamp_min(0).to(dtype=torch.long)
+        gathered_candidates = candidates.gather(1, accepted_rows).to(dtype=torch.int32)
+        output[:, :budget] = torch.where(
+            torch.arange(budget, device=device).view(1, budget)
+            < accept_token_num.view(batch_size, 1),
+            gathered_candidates[:, 1 : budget + 1],
+            output[:, :budget],
+        )
+        bonus_cols = accept_token_num.view(batch_size, 1).to(dtype=torch.long)
+        bonus_rows = accepted_rows.gather(1, bonus_cols)
+        bonus_tokens = target_predict.gather(1, bonus_rows).to(dtype=torch.int32)
+        output.scatter_(1, bonus_cols, bonus_tokens)
+        gdn_state_indices = bonus_rows.squeeze(1).to(dtype=torch.int32) + 1
+        return output, gdn_state_indices
+
+    _ddtree_verify_greedy_kernel[(batch_size,)](
+        target_predict,
+        draft_tokens,
+        retrieve_next_token_i32,
+        retrieve_next_sibling_i32,
+        output,
+        gdn_state_indices,
+        budget,
+        output.stride(0),
+    )
+    return output, gdn_state_indices
+
+
+def ddtree_verify_lazy_logits(
+    compute_logits: Callable[[torch.Tensor], torch.Tensor],
+    sample_hidden_states: torch.Tensor,
+    sample_row_starts: list[int],
+    draft_token_ids: torch.Tensor,
+    child_maps: list[list[dict[int, int]]],
+    budget: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Verify a DDTree while projecting logits only for rows that matter.
+
+    The target transformer still runs all tree nodes. For greedy verification,
+    full-vocab logits are needed for the root and tree nodes that have children;
+    leaf logits are only needed for the single leaf on the accepted path to
+    produce the bonus token. This avoids projecting every dead leaf.
+    """
+    batch_size = len(child_maps)
+    draft_tokens_cpu = draft_token_ids.view(batch_size, budget).cpu().tolist()
+
+    internal_rows: list[int] = []
+    internal_nodes_by_req: list[list[int]] = []
+    for r, maps in enumerate(child_maps):
+        nodes = [
+            node_idx
+            for node_idx, children in enumerate(maps[: budget + 1])
+            if children
+        ]
+        internal_nodes_by_req.append(nodes)
+        row_start = sample_row_starts[r]
+        internal_rows.extend(row_start + node_idx for node_idx in nodes)
+
+    posterior_by_req: list[dict[int, int]] = [dict() for _ in range(batch_size)]
+    if internal_rows:
+        rows_t = torch.tensor(internal_rows, dtype=torch.long, device=device)
+        internal_posterior = (
+            compute_logits(sample_hidden_states[rows_t]).argmax(dim=-1).cpu().tolist()
+        )
+        cursor = 0
+        for r, nodes in enumerate(internal_nodes_by_req):
+            for node_idx in nodes:
+                posterior_by_req[r][node_idx] = int(internal_posterior[cursor])
+                cursor += 1
+
+    accepted_paths: list[list[int]] = []
+    bonus_tokens: list[int | None] = []
+    leaf_bonus_rows: list[int] = []
+    leaf_bonus_req_order: list[int] = []
+
+    for r, maps in enumerate(child_maps):
+        accepted_indices = [0]
+        current_index = 0
+        bonus_token: int | None = None
+
+        while True:
+            next_token = posterior_by_req[r].get(current_index)
+            if next_token is None:
+                leaf_bonus_req_order.append(r)
+                leaf_bonus_rows.append(sample_row_starts[r] + current_index)
+                break
+            if next_token not in maps[current_index]:
+                bonus_token = int(next_token)
+                break
+            current_index = maps[current_index][next_token]
+            accepted_indices.append(current_index)
+
+        accepted_paths.append(accepted_indices)
+        bonus_tokens.append(bonus_token)
+
+    if leaf_bonus_rows:
+        rows_t = torch.tensor(leaf_bonus_rows, dtype=torch.long, device=device)
+        leaf_bonus = (
+            compute_logits(sample_hidden_states[rows_t]).argmax(dim=-1).cpu().tolist()
+        )
+        for req_idx, token_id in zip(leaf_bonus_req_order, leaf_bonus):
+            bonus_tokens[req_idx] = int(token_id)
+
+    output = torch.full((batch_size, budget + 1), -1, dtype=torch.int32)
+    gdn_state_indices = torch.ones(batch_size, dtype=torch.int32)
+    for r, accepted_indices in enumerate(accepted_paths):
+        gdn_state_indices[r] = int(accepted_indices[-1]) + 1
+        out_pos = 0
+        for node_idx in accepted_indices[1:]:
+            output[r, out_pos] = draft_tokens_cpu[r][node_idx - 1]
+            out_pos += 1
+        output[r, out_pos] = int(bonus_tokens[r])
+
+    return output.to(device), gdn_state_indices.to(device)
 
 
 class DDTreeProposer(DFlashProposer):
@@ -397,6 +1379,9 @@ class DDTreeProposer(DFlashProposer):
         self._budget = self.num_speculative_tokens
         self._child_maps: list[list[dict[int, int]]] | None = None
         self._node_depths: list[torch.Tensor] | None = None
+        self._tree_req_ids: list[str] | None = None
+        self._draft_token_ids_cpu_cache: list[list[int]] | None = None
+        self._uploaded_static_visibility_key: tuple[int, int, int] | None = None
 
     @override
     def build_per_group_and_layer_attn_metadata(
@@ -427,74 +1412,184 @@ class DDTreeProposer(DFlashProposer):
             [batch * budget] int64 — flattened draft token IDs in
             tree-node order, varying per request.
         """
-        depth = self.num_speculative_tokens  # DFlash depth == num_spec_tokens
+        depth = self.dflash_draft_depth  # DFlash depth can be below tree budget.
         batch_size = hidden_states.shape[0] // depth
 
-        logits = self.model.compute_logits(hidden_states)
-        vocab_size = logits.shape[-1]
-        logits_per_req = logits.float().view(batch_size, depth, vocab_size)
+        if self._runner is not None:
+            prompt_lens = self._runner.input_batch.num_prompt_tokens[:batch_size]
+            if not should_use_ddtree_for_prompt_lens(prompt_lens):
+                self._child_maps = None
+                self._node_depths = None
+                self._tree_req_ids = None
+                self._draft_token_ids_cpu_cache = None
+                self._reset_target_flat_chain_visibility()
+                return SpecDecodeBaseProposer._greedy_sample(self, hidden_states)
+
+        with _ddtree_profile_range("draft_logits", rows=hidden_states.shape[0]):
+            logits = self.model.compute_logits(hidden_states)
+            vocab_size = logits.shape[-1]
+            logits_per_req = logits.view(batch_size, depth, vocab_size)
+
+        if self._runner is not None:
+            self._tree_req_ids = list(self._runner.input_batch.req_ids)[:batch_size]
+        else:
+            self._tree_req_ids = None
 
         all_child_maps: list[list[dict[int, int]]] = []
         all_draft_tokens: list[torch.Tensor] = []
+        all_draft_token_lists: list[list[int]] = []
         all_visibility: list[torch.Tensor] = []
-        all_node_depths: list[torch.Tensor] = []
         target_size = self._budget + 1  # [N+1, N+1] per request
+        gpu_static_tree = (
+            os.environ.get("DDTREE_GPU_STATIC_TREE") == "1"
+            and os.environ.get("DDTREE_SGL_VERIFY") == "1"
+        )
 
-        for r in range(batch_size):
-            (
-                node_token_ids,
-                node_depths,
-                _,
-                _,
-                child_maps,
-                visibility,
-            ) = build_ddtree_tree(logits_per_req[r], budget=self._budget)
-            all_child_maps.append(child_maps)
-
-            # Draft tokens for this request, padded to budget.
-            tokens = node_token_ids.to(self.device)
-            budget_actual = tokens.shape[0]
-            if budget_actual < self._budget:
-                tokens = torch.cat(
-                    [tokens, tokens.new_zeros(self._budget - budget_actual)]
+        with _ddtree_profile_range("tree_build", batch=batch_size, budget=self._budget):
+            for r in range(batch_size):
+                (
+                    node_token_ids,
+                    node_depths,
+                    _,
+                    _,
+                    child_maps,
+                    visibility,
+                ) = build_ddtree_tree(
+                    logits_per_req[r],
+                    budget=self._budget,
+                    force_chain_prefix=int(
+                        os.environ.get("DDTREE_FORCE_CHAIN_PREFIX", "0") or "0"
+                    ),
                 )
-            all_draft_tokens.append(tokens)
+                all_child_maps.append(child_maps)
 
-            # Node depths padded to budget; unused slots get sequential depths
-            # so their positions stay consistent (non-zero depth avoids root clash).
-            depths = node_depths.to(self.device, dtype=torch.long)
-            if budget_actual < self._budget:
-                pad = torch.arange(
-                    budget_actual + 1,
-                    budget_actual + 1 + (self._budget - budget_actual),
-                    dtype=torch.long,
-                    device=self.device,
-                )
-                depths = torch.cat([depths, pad])
-            all_node_depths.append(depths)
+                # Draft tokens for this request, padded to budget.
+                budget_actual = node_token_ids.shape[0]
+                if gpu_static_tree:
+                    token_list = []
+                else:
+                    with _ddtree_cpu_profile_range("greedy_node_tokens_tolist", budget=budget_actual):
+                        token_list = [int(token_id) for token_id in node_token_ids.tolist()]
+                with _ddtree_cpu_profile_range("greedy_node_tokens_h2d", budget=budget_actual):
+                    tokens = node_token_ids.to(self.device)
+                if budget_actual < self._budget:
+                    if not gpu_static_tree:
+                        token_list.extend([0] * (self._budget - budget_actual))
+                    with _ddtree_cpu_profile_range("greedy_node_tokens_pad", budget=self._budget):
+                        tokens = torch.cat(
+                            [tokens, tokens.new_zeros(self._budget - budget_actual)]
+                        )
+                if not gpu_static_tree:
+                    all_draft_token_lists.append(token_list)
+                all_draft_tokens.append(tokens)
 
-            # Visibility mask padded to [target_size, target_size].
-            vis_size = visibility.shape[0]  # budget_actual + 1
-            if vis_size < target_size:
-                padded = torch.zeros(target_size, target_size, dtype=torch.bool)
-                padded[:vis_size, :vis_size] = visibility
-                visibility = padded
-            all_visibility.append(visibility)
+                # Visibility mask padded to [target_size, target_size].
+                vis_size = visibility.shape[0]  # budget_actual + 1
+                if vis_size < target_size:
+                    padded = torch.zeros(target_size, target_size, dtype=torch.bool)
+                    padded[:vis_size, :vis_size] = visibility
+                    visibility = padded
+                all_visibility.append(visibility)
 
         self._child_maps = all_child_maps
-        self._node_depths = all_node_depths
+        self._node_depths = None
+        self._draft_token_ids_cpu_cache = None if gpu_static_tree else all_draft_token_lists
 
-        # Stack per-request masks: [batch, N+1, N+1] → 3D qq_bias.
-        stacked = torch.stack(all_visibility, dim=0)  # [batch, N+1, N+1]
-        tree_attn_bias = torch.where(
-            stacked.to(self.device),
-            torch.zeros(1, dtype=torch.float32, device=self.device),
-            torch.full((1,), float("-inf"), dtype=torch.float32, device=self.device),
+        # Stack per-request masks. For the batch-1 latency harness, a 2D bias
+        # is exact and uses the cheaper TreeAttention path. Batched requests may
+        # have different DDTree topologies, so they still require 3D per-request
+        # bias.
+        with _ddtree_cpu_profile_range("greedy_visibility_stack", batch=batch_size, budget=self._budget):
+            stacked = (
+                all_visibility[0]
+                if batch_size == 1
+                else torch.stack(all_visibility, dim=0)
+            )
+        static_siblings = int(os.environ.get("DDTREE_STATIC_SIBLINGS", "0") or "0")
+        force_chain_prefix = int(os.environ.get("DDTREE_FORCE_CHAIN_PREFIX", "0") or "0")
+        static_visibility_key = None
+        if static_siblings > 0 and batch_size == 1:
+            chain_len = max(0, min(force_chain_prefix, self._budget, depth))
+            branch_count = max(0, min(static_siblings, self._budget - chain_len, chain_len))
+            static_visibility_key = (chain_len, branch_count, chain_len + branch_count)
+
+        with _ddtree_profile_range("bias_update", batch=batch_size, budget=self._budget):
+            if (
+                static_visibility_key is not None
+                and self._uploaded_static_visibility_key == static_visibility_key
+            ):
+                pass
+            elif batch_size == 1:
+                self._update_target_tree_visibility(stacked)
+                self._uploaded_static_visibility_key = static_visibility_key
+            else:
+                tree_attn_bias = torch.where(
+                    stacked.to(self.device),
+                    torch.zeros(1, dtype=torch.float32, device=self.device),
+                    torch.full(
+                        (1,), float("-inf"), dtype=torch.float32, device=self.device
+                    ),
+                )
+                self._update_target_tree_attn_bias(tree_attn_bias)
+                self._uploaded_static_visibility_key = None
+
+        with _ddtree_profile_range("draft_pack", batch=batch_size, budget=self._budget):
+            if batch_size == 1:
+                return all_draft_tokens[0].to(torch.long)
+            draft = torch.stack(all_draft_tokens, dim=0)  # [batch, budget]
+            return draft.reshape(-1).to(torch.long)  # [batch * budget]
+
+    def _reset_target_flat_chain_visibility(self) -> None:
+        if self._runner is None:
+            return
+        self._uploaded_static_visibility_key = None
+        found_tree_attn = False
+        for attn_groups in self._runner.attn_groups:
+            for attn_group in attn_groups:
+                builder = attn_group.get_metadata_builder()
+                if isinstance(builder, TreeAttentionMetadataBuilder):
+                    builder.tree_attn_bias = torch.empty(0, device=self.device)
+                    builder.reorder_batch_threshold = self._budget
+                    builder._tree_decode_threshold = self._budget + 1
+                    found_tree_attn = True
+        assert found_tree_attn, (
+            "DDTreeProposer requires the target model to use the TREE_ATTN "
+            "attention backend. Set attention_config.backend = 'TREE_ATTN' "
+            "in your vllm config."
         )
-        self._update_target_tree_attn_bias(tree_attn_bias)
 
-        draft = torch.stack(all_draft_tokens, dim=0)  # [batch, budget]
-        return draft.reshape(-1).to(torch.long)  # [batch * budget]
+    def _update_target_tree_visibility(self, visibility: torch.Tensor) -> None:
+        if self._runner is None:
+            return
+        found_tree_attn = False
+        visibility_gpu = visibility.to(self.device)
+        target_size = visibility_gpu.shape[-1]
+        for attn_groups in self._runner.attn_groups:
+            for attn_group in attn_groups:
+                builder = attn_group.get_metadata_builder()
+                if isinstance(builder, TreeAttentionMetadataBuilder):
+                    current_bias = builder.tree_attn_bias
+                    if (
+                        current_bias is None
+                        or current_bias.shape != visibility_gpu.shape
+                        or current_bias.device != visibility_gpu.device
+                    ):
+                        current_bias = torch.empty(
+                            visibility_gpu.shape,
+                            dtype=torch.float32,
+                            device=visibility_gpu.device,
+                        )
+                        builder.tree_attn_bias = current_bias
+                    current_bias.fill_(float("-inf"))
+                    current_bias.masked_fill_(visibility_gpu, 0.0)
+                    builder.reorder_batch_threshold = target_size - 1
+                    builder._tree_decode_threshold = target_size
+                    found_tree_attn = True
+        assert found_tree_attn, (
+            "DDTreeProposer requires the target model to use the TREE_ATTN "
+            "attention backend. Set attention_config.backend = 'TREE_ATTN' "
+            "in your vllm config."
+        )
 
     def _update_target_tree_attn_bias(self, tree_attn_bias: torch.Tensor) -> None:
         """Push a new tree_attn_bias to all TreeAttentionMetadataBuilders.
@@ -509,7 +1604,16 @@ class DDTreeProposer(DFlashProposer):
             for attn_group in attn_groups:
                 builder = attn_group.get_metadata_builder()
                 if isinstance(builder, TreeAttentionMetadataBuilder):
-                    builder.tree_attn_bias = tree_attn_bias
+                    current_bias = builder.tree_attn_bias
+                    if (
+                        current_bias is not None
+                        and current_bias.shape == tree_attn_bias.shape
+                        and current_bias.dtype == tree_attn_bias.dtype
+                        and current_bias.device == tree_attn_bias.device
+                    ):
+                        current_bias.copy_(tree_attn_bias)
+                    else:
+                        builder.tree_attn_bias = tree_attn_bias
                     # N = budget; reorder threshold = N so spec-decodes (q_len=N+1)
                     # land in region 2 (long_extend) after regular decodes (region 0),
                     # giving forward() a clean split point.
