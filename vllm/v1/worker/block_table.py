@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
+
 import numpy as np
 import torch
 
@@ -145,11 +147,16 @@ class BlockTable:
         positions: torch.Tensor,
     ) -> None:
         num_tokens = positions.shape[0]
+        max_num_tokens = (
+            num_tokens
+            if os.environ.get("VLLM_SLOT_MAPPING_NO_FULL_PAD") == "1"
+            else self.max_num_batched_tokens
+        )
         total_cp_world_size = self.pcp_world_size * self.dcp_world_size
         total_cp_rank = self.pcp_rank * self.dcp_world_size + self.dcp_rank
         _compute_slot_mapping_kernel[(num_reqs + 1,)](
             num_tokens,
-            self.max_num_batched_tokens,
+            max_num_tokens,
             query_start_loc,
             positions,
             self.block_table.gpu,

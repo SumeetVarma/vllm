@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import ast
+import os
+import time
+from contextlib import contextmanager
 from importlib.util import find_spec
 from typing import Any, cast
 
@@ -55,6 +58,25 @@ from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.utils import AttentionGroup
 
 logger = init_logger(__name__)
+
+
+@contextmanager
+def _spec_profile_range(name: str, **fields: Any):
+    if os.environ.get("DTREE_PROFILE") != "1":
+        yield
+        return
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    start_time = time.perf_counter()
+    try:
+        yield
+    finally:
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        elapsed_ms = (time.perf_counter() - start_time) * 1000.0
+        field_text = " ".join(f"{key}={value}" for key, value in fields.items())
+        logger.info("DTREE_PROFILE drafter_%s %.3fms %s",
+                    name, elapsed_ms, field_text)
 
 
 class SpecDecodeBaseProposer:
@@ -452,57 +474,65 @@ class SpecDecodeBaseProposer:
                     DFlashQwen3ForCausalLM,
                 ),
             )
-            target_hidden_states = self.model.combine_hidden_states(
-                target_hidden_states
-            )
+            with _spec_profile_range("combine_hidden", method=self.method):
+                target_hidden_states = self.model.combine_hidden_states(
+                    target_hidden_states
+                )
             assert target_hidden_states.shape[-1] == self.hidden_size
 
-        num_tokens, token_indices_to_sample, common_attn_metadata = (
-            self.set_inputs_first_pass(
-                target_token_ids=target_token_ids,
-                next_token_ids=next_token_ids,
-                target_positions=target_positions,
-                target_hidden_states=target_hidden_states,
-                token_indices_to_sample=token_indices_to_sample,
-                cad=common_attn_metadata,
-                num_rejected_tokens_gpu=num_rejected_tokens_gpu,
+        with _spec_profile_range("set_inputs_first_pass", method=self.method):
+            num_tokens, token_indices_to_sample, common_attn_metadata = (
+                self.set_inputs_first_pass(
+                    target_token_ids=target_token_ids,
+                    next_token_ids=next_token_ids,
+                    target_positions=target_positions,
+                    target_hidden_states=target_hidden_states,
+                    token_indices_to_sample=token_indices_to_sample,
+                    cad=common_attn_metadata,
+                    num_rejected_tokens_gpu=num_rejected_tokens_gpu,
+                )
             )
-        )
 
-        per_group_attn_metadata, per_layer_attn_metadata = (
-            self.build_per_group_and_layer_attn_metadata(common_attn_metadata)
-        )
+        with _spec_profile_range("build_attn_metadata", method=self.method):
+            per_group_attn_metadata, per_layer_attn_metadata = (
+                self.build_per_group_and_layer_attn_metadata(common_attn_metadata)
+            )
 
-        cudagraph_runtime_mode, num_input_tokens, num_tokens_across_dp = (
-            self._determine_batch_execution_and_padding(num_tokens)
-        )
+        with _spec_profile_range("determine_padding", method=self.method):
+            cudagraph_runtime_mode, num_input_tokens, num_tokens_across_dp = (
+                self._determine_batch_execution_and_padding(num_tokens)
+            )
 
-        model_kwargs, slot_mapping_size = self.build_model_inputs_first_pass(
-            num_tokens, num_input_tokens, mm_embed_inputs
-        )
+        with _spec_profile_range("build_model_inputs", method=self.method):
+            model_kwargs, slot_mapping_size = self.build_model_inputs_first_pass(
+                num_tokens, num_input_tokens, mm_embed_inputs
+            )
 
-        with set_forward_context(
-            per_layer_attn_metadata,
-            self.vllm_config,
-            num_tokens=num_input_tokens,
-            num_tokens_across_dp=num_tokens_across_dp,
-            cudagraph_runtime_mode=cudagraph_runtime_mode,
-            slot_mapping=self._get_slot_mapping(
-                slot_mapping_size, common_attn_metadata.slot_mapping
-            ),
-        ):
-            ret_hidden_states = self.model(**model_kwargs)
-            if not self.model_returns_tuple():
-                last_hidden_states = ret_hidden_states
-                hidden_states = last_hidden_states
-            else:
-                last_hidden_states, hidden_states = ret_hidden_states
+        with _spec_profile_range("draft_forward", method=self.method):
+            with set_forward_context(
+                per_layer_attn_metadata,
+                self.vllm_config,
+                num_tokens=num_input_tokens,
+                num_tokens_across_dp=num_tokens_across_dp,
+                cudagraph_runtime_mode=cudagraph_runtime_mode,
+                slot_mapping=self._get_slot_mapping(
+                    slot_mapping_size, common_attn_metadata.slot_mapping
+                ),
+            ):
+                ret_hidden_states = self.model(**model_kwargs)
+                if not self.model_returns_tuple():
+                    last_hidden_states = ret_hidden_states
+                    hidden_states = last_hidden_states
+                else:
+                    last_hidden_states, hidden_states = ret_hidden_states
 
-        sample_hidden_states = last_hidden_states[token_indices_to_sample]
+        with _spec_profile_range("gather_sample_hidden", method=self.method):
+            sample_hidden_states = last_hidden_states[token_indices_to_sample]
 
         # Early exit if there is only one draft token to be generated.
         if self.num_speculative_tokens == 1 or self.parallel_drafting:
-            draft_token_ids = self._greedy_sample(sample_hidden_states)
+            with _spec_profile_range("select_tokens", method=self.method):
+                draft_token_ids = self._greedy_sample(sample_hidden_states)
             return draft_token_ids.view(-1, self.num_speculative_tokens)
 
         if self.uses_mrope:

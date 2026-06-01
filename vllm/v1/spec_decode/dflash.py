@@ -81,6 +81,21 @@ class DFlashProposer(SpecDecodeBaseProposer):
         # For DFlash we use the input embeddings to embed the mask token
         self.parallel_drafting_hidden_state_tensor = None
 
+        # DFLASH_FLAT_FAST_PATCH: reuse per-step DFlash/DDTree flat-path
+        # buffers. This avoids small CUDA/CPU allocations in every speculative
+        # round while keeping the default path unchanged.
+        self._flat_fast = os.environ.get("DFLASH_FLAT_FAST", "0") == "1"
+        if self._flat_fast:
+            self._token_indices_to_sample_buffer = torch.empty(
+                self.max_batch_size * self.dflash_draft_depth,
+                dtype=torch.int32,
+                device=device,
+            )
+            self._query_start_loc_cpu_buffer = (
+                torch.arange(self.max_batch_size + 1, dtype=torch.int32)
+                * (1 + self.dflash_draft_depth)
+            )
+
     @override
     def _create_draft_vllm_config(self) -> VllmConfig:
         base = super()._create_draft_vllm_config()
@@ -123,11 +138,16 @@ class DFlashProposer(SpecDecodeBaseProposer):
         # does not run in a CUDA graph
         self._dflash_hidden_states = target_hidden_states
 
-        token_indices_to_sample = torch.empty(
-            batch_size * draft_depth,
-            dtype=torch.int32,
-            device=self.device,
-        )
+        if self._flat_fast:
+            token_indices_to_sample = self._token_indices_to_sample_buffer[
+                : batch_size * draft_depth
+            ]
+        else:
+            token_indices_to_sample = torch.empty(
+                batch_size * draft_depth,
+                dtype=torch.int32,
+                device=self.device,
+            )
 
         # Launch fused triton kernel for input_ids, positions, slot_mapping,
         # and token_indices_to_sample
@@ -186,7 +206,9 @@ class DFlashProposer(SpecDecodeBaseProposer):
             query_start_loc=new_query_start_loc,
             seq_lens=effective_seq_lens + num_query_per_req,
             query_start_loc_cpu=(
-                torch.from_numpy(self.token_arange_np[: batch_size + 1]).clone()
+                self._query_start_loc_cpu_buffer[: batch_size + 1]
+                if self._flat_fast
+                else torch.from_numpy(self.token_arange_np[: batch_size + 1]).clone()
                 * num_query_per_req
             ),
             _seq_lens_cpu=None,
