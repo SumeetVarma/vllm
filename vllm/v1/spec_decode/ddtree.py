@@ -2027,6 +2027,79 @@ class DDTreeProposer(DFlashProposer):
             os.environ.get("DDTREE_GPU_STATIC_TREE") == "1"
             and os.environ.get("DDTREE_SGL_VERIFY") == "1"
         )
+        static_interleave = os.environ.get("DDTREE_STATIC_INTERLEAVE") == "1"
+        use_direct_static_gpu_tree = (
+            gpu_static_tree
+            and not static_interleave
+            and logits_per_req is not None
+            and static_branch_count > 0
+            and static_chain_len + static_branch_count == self._budget
+        )
+
+        if use_direct_static_gpu_tree:
+            with _ddtree_profile_range(
+                "static_direct_pack", batch=batch_size, budget=self._budget
+            ):
+                assert logits_per_req is not None
+                top1_per_req = logits_per_req[:, :static_chain_len, :].argmax(dim=-1)
+                branch_top2_per_req = torch.topk(
+                    logits_per_req[:, :static_branch_count, :].float(),
+                    k=2,
+                    dim=-1,
+                ).indices[:, :, 1]
+                draft = torch.cat(
+                    [top1_per_req, branch_top2_per_req], dim=1
+                ).to(dtype=torch.long)
+
+            _, _, _, visibility = _build_static_sibling_topology(
+                static_chain_len, static_branch_count, static_interleave
+            )
+            child_maps = _build_static_sibling_child_maps(
+                static_chain_len, static_branch_count
+            )
+            self._child_maps = [child_maps for _ in range(batch_size)]
+            self._node_depths = None
+            self._draft_token_ids_cpu_cache = None
+
+            static_visibility_key = (
+                static_chain_len,
+                static_branch_count,
+                self._budget,
+                0,
+            )
+            with _ddtree_profile_range(
+                "bias_update", batch=batch_size, budget=self._budget
+            ):
+                if (
+                    batch_size == 1
+                    and self._uploaded_static_visibility_key
+                    == static_visibility_key
+                ):
+                    pass
+                elif batch_size == 1:
+                    self._update_target_tree_visibility(visibility)
+                    self._uploaded_static_visibility_key = static_visibility_key
+                else:
+                    stacked = visibility.expand(batch_size, -1, -1)
+                    tree_attn_bias = torch.where(
+                        stacked.to(self.device),
+                        torch.zeros(1, dtype=torch.float32, device=self.device),
+                        torch.full(
+                            (1,),
+                            float("-inf"),
+                            dtype=torch.float32,
+                            device=self.device,
+                        ),
+                    )
+                    self._update_target_tree_attn_bias(tree_attn_bias)
+                    self._uploaded_static_visibility_key = None
+
+            with _ddtree_profile_range(
+                "draft_pack", batch=batch_size, budget=self._budget
+            ):
+                if batch_size == 1:
+                    return draft[0]
+                return draft.reshape(-1)
 
         with _ddtree_profile_range("tree_build", batch=batch_size, budget=self._budget):
             for r in range(batch_size):
